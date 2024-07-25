@@ -53,6 +53,7 @@ def experiment(args, model_class, datamodule_class):
     model, _, _ = main(args, model, datamodule_class)
 
     new_args = set_llr_args(args, "llr")
+    new_args.retrain_type = "erm" # Use training set, not held-out set.
     train_fc_only(model)
     model.hparams.train_type = "llr"
     main(new_args, model, datamodule_class)
