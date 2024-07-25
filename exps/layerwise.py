@@ -47,8 +47,12 @@ def experiment(args, model_class, datamodule_class):
     args.num_groups = args.num_classes * 2
     model = model_class(args)
 
-    for p in model.model.fc.parameters():
-        p.requires_grad = False
+    try:
+        for p in model.model.fc.parameters():
+            p.requires_grad = False
+    except:
+        for p in model.model.classifier.parameters():
+            p.requires_grad = False
     model.hparams.train_type = "erm"
     model, _, _ = main(args, model, datamodule_class)
 
