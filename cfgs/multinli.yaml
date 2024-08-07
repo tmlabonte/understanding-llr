@@ -1,6 +1,6 @@
 accelerator: gpu
 batch_size: 32
-check_val_every_n_epochs: 2
+check_val_every_n_epochs: 20
 ckpt_every_n_epochs: 2
 datamodule: multinli
 devices: 1

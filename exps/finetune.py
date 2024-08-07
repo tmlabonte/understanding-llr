@@ -30,8 +30,9 @@ from milkshake.models.resnet import ResNet
 from milkshake.utils import to_np
 
 
-METRICS = ["test_aa", "test_acc_by_group", "test_wga", "train_aa",
-           "train_acc_by_group", "train_wga", "version"]
+METRICS = ["test_aa", "test_acc_by_class", "test_acc_by_group",
+            "test_wca", "test_wga", "train_aa", "train_acc_by_class",
+            "train_acc_by_group", "train_wca", "train_wga", "version"]
 SEEDS = [1, 2, 3]
 TRAIN_TYPES = ["erm", "llr", "dfr"]
 
@@ -96,7 +97,6 @@ def log_results(
 
     results = {m: {} for m in METRICS}
 
-    # Dataloader 0 is the training set, while dataloader 1 is the test set.
     train_group_proportions = []
     for idx, step_output in enumerate(validation_step_outputs):
         prefix = "train_" if idx == 0 else "test_"
@@ -109,21 +109,30 @@ def log_results(
         # compute the test average accuracy as a weighted sum of the group
         # accuracies with respect to the training distribution proportions.
         total_by_group = collate_and_sum("total_by_group")
+        total_by_class = collate_and_sum("total_by_class")  # Assuming you have this key in step_output
         if idx == 0:
             train_group_proportions = total_by_group / sum(total_by_group)
         correct_by_group = collate_and_sum("correct_by_group")
+        correct_by_class = collate_and_sum("correct_by_class")  # Assuming you have this key in step_output
+
         acc_by_group = correct_by_group / total_by_group
+        acc_by_class = correct_by_class / total_by_class  # Compute accuracy by class
+
         worst_group_acc = min(acc_by_group).item()
+        worst_class_acc = min(acc_by_class).item()  # Compute the worst class accuracy
+
         if idx == 1 and weight_aa_by_proportion:
             average_acc = correct_by_group / total_by_group
             average_acc = sum(average_acc * train_group_proportions).item()
         else:
             average_acc = (sum(correct_by_group) / sum(total_by_group)).item()
-            
+
         # Adds metrics to results dict.
         results[prefix + "aa"] = average_acc
         results[prefix + "wga"] = worst_group_acc
+        results[prefix + "wca"] = worst_class_acc  # Add worst class accuracy to results
         results[prefix + "acc_by_group"] = list(to_np(acc_by_group))
+        results[prefix + "acc_by_class"] = list(to_np(acc_by_class))  # Optionally add class accuracies to results
 
     results["version"] = version
     dump_results(args, epoch, results)
