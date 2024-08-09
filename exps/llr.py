@@ -138,16 +138,18 @@ def experiment(args, model_class, datamodule_class):
 
     # Performs LLR.
     new_args = set_llr_args(args, "llr")
-    train_fc_only(model)
+    args.train_type = "llr"  # Used for dumping results
     model.hparams.train_type = "llr"
+    train_fc_only(model)
     model, _, _ = main(
         new_args, model, datamodule_class, model_hooks=[reset_fc_hook])
 
     """
     # Performs DFR.
     new_args = set_llr_args(args, "dfr")
-    train_fc_only(model)
+    args.train_type = "dfr" # Used for dumping results
     model.hparams.train_type = "dfr"
+    train_fc_only(model)
     model, _, _ = main(
         new_args, model, datamodule_class, model_hooks=[reset_fc_hook])
     """
