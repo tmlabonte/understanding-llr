@@ -351,6 +351,11 @@ class FeatureCollapseResNet(ResNet):
             weight_aa_by_proportion=self.hparams.datamodule == "waterbirds",
         )
 
+        collapse_metrics = self.compute_collapse_metrics()
+
+        dump_results(args, self.current_epoch + 1, collapse_metrics)
+
+
 
 def log_results(
     args,
