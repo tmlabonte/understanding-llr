@@ -32,7 +32,9 @@ from milkshake.utils import to_np
 
 METRICS = ["test_aa", "test_acc_by_class", "test_acc_by_group",
             "test_wca", "test_wga", "train_aa", "train_acc_by_class",
-            "train_acc_by_group", "train_wca", "train_wga", "version"]
+            "train_acc_by_group", "train_wca", "train_wga", "version",
+            "global_cov", "inter_class_cov", "intra_class_cov", 
+            "inter_group_cov", "intra_group_cov", "class_trace", "group_trace"]
 SEEDS = [1, 2, 3]
 TRAIN_TYPES = ["erm", "llr", "dfr"]
 

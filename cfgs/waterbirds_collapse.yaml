@@ -7,6 +7,6 @@ devices: 1
 lr: 3e-3
 lr_scheduler: cosine
 max_epochs: 100
-metrics: [loss, acc, acc_by_group, global_cov, inter_class_cov, intra_class_cov, inter_group_cov, intra_group_cov, class_trace, group_trace]
+metrics: [loss, acc, acc_by_class, acc_by_group, global_cov, inter_class_cov, intra_class_cov, inter_group_cov, intra_group_cov, class_trace, group_trace]
 model: resnet
 resnet_version: 18
