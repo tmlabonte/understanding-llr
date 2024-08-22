@@ -270,7 +270,22 @@ class FeatureCollapseResNet(ResNet):
             inter_class_cov_norm = torch.norm(inter_class_cov, p="fro")
             intra_class_cov_norm = torch.norm(intra_class_cov, p="fro")
 
+            # Debugging the matrices
+            print("intra_class_cov shape:", intra_class_cov.shape)
+            print("inter_class_cov shape:", inter_class_cov.shape)
+            print("Any NaN in intra_class_cov:", torch.isnan(intra_class_cov).any())
+            print("Any NaN in inter_class_cov:", torch.isnan(inter_class_cov).any())
+
+            # Handle NaN values if found
+            intra_class_cov = torch.nan_to_num(intra_class_cov, nan=0.0)
+            inter_class_cov = torch.nan_to_num(inter_class_cov, nan=0.0)
+
+            # Switch to different linear algebra backend
+            torch.backends.cuda.preferred_linalg_library('MAGMA')
+
+            # The problematic line
             class_trace = (intra_class_cov * torch.linalg.pinv(inter_class_cov, hermitian=True).t()).sum() / self.hparams.num_classes
+            
             return inter_class_cov_norm, intra_class_cov_norm, class_trace
         elif mode == "group":
             centered_group_means = mode_means - global_mean
@@ -283,7 +298,21 @@ class FeatureCollapseResNet(ResNet):
             inter_group_cov_norm = torch.norm(inter_group_cov, p="fro")
             intra_group_cov_norm = torch.norm(intra_group_cov, p="fro")
 
-            group_trace = (intra_group_cov * torch.linalg.pinv(inter_group_cov, hermitian=True).t()).sum() / self.hparams.num_groups
+            # Debugging the matrices
+            print("intra_group_cov shape:", intra_group_cov.shape)
+            print("inter_group_cov shape:", inter_group_cov.shape)
+            print("Any NaN in intra_group_cov:", torch.isnan(intra_group_cov).any())
+            print("Any NaN in inter_group_cov:", torch.isnan(inter_group_cov).any())
+
+            # Handle NaN values if found
+            intra_group_cov = torch.nan_to_num(intra_group_cov, nan=0.0)
+            inter_group_cov = torch.nan_to_num(inter_group_cov, nan=0.0)
+
+            # Switch to different linear algebra backend
+            torch.backends.cuda.preferred_linalg_library('MAGMA')
+
+            # The problematic line
+            group_trace = (intra_group_cov * torch.linalg.pinv(inter_group_cov, hermitian=True).t()).sum() / self.hparams.num_classes
             return inter_group_cov_norm, intra_group_cov_norm, group_trace
 
     def compute_collapse_metrics(self):
