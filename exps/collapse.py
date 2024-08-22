@@ -257,7 +257,7 @@ class FeatureCollapseResNet(ResNet):
 
         if mode == "total":
             total_cov /= num_samples
-            total_cov_norm = torch.frobenius_norm(total_cov)
+            total_cov_norm = torch.norm(total_cov, p="fro")
             return total_cov_norm
         elif mode == "class":
             centered_class_means = mode_means - global_mean
@@ -267,8 +267,8 @@ class FeatureCollapseResNet(ResNet):
             inter_class_cov /= self.hparams.num_classes
             intra_class_cov /= num_samples
 
-            inter_class_cov_norm = torch.frobenius_norm(inter_class_cov)
-            intra_class_cov_norm = torch.frobenius_norm(intra_class_cov)
+            inter_class_cov_norm = torch.norm(inter_class_cov, p="fro")
+            intra_class_cov_norm = torch.norm(intra_class_cov, p="fro")
 
             class_trace = (intra_class_cov * torch.linalg.pinv(inter_class_cov, hermitian=True).t()).sum() / self.hparams.num_classes
             return inter_class_cov_norm, intra_class_cov_norm, class_trace
@@ -280,8 +280,8 @@ class FeatureCollapseResNet(ResNet):
             inter_group_cov /= self.hparams.num_groups
             intra_group_cov /= num_samples
 
-            inter_group_cov_norm = torch.frobenius_norm(inter_group_cov)
-            intra_group_cov_norm = torch.frobenius_norm(intra_group_cov)
+            inter_group_cov_norm = torch.norm(inter_group_cov, p="fro")
+            intra_group_cov_norm = torch.norm(intra_group_cov, p="fro")
 
             group_trace = (intra_group_cov * torch.linalg.pinv(inter_group_cov, hermitian=True).t()).sum() / self.hparams.num_groups
             return inter_group_cov_norm, intra_group_cov_norm, group_trace

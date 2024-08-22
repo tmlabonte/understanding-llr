@@ -1,7 +1,8 @@
 accelerator: gpu
 batch_size: 32
-check_val_every_n_epoch: 10
-ckpt_every_n_epoch: 10
+check_val_every_n_epochs: 10
+ckpt_every_n_epochs: 100
+num_sanity_val_steps: 0
 datamodule: waterbirds
 devices: 1
 lr: 3e-3
@@ -10,3 +11,4 @@ max_epochs: 100
 metrics: [loss, acc, acc_by_class, acc_by_group, global_cov, inter_class_cov, intra_class_cov, inter_group_cov, intra_group_cov, class_trace, group_trace]
 model: resnet
 resnet_version: 18
+wandb: True
