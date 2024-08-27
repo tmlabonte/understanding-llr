@@ -314,8 +314,10 @@ class Model(pl.LightningModule):
         elif self.hparams.loss == "mse":
             if self.hparams.num_classes == 1:
                 loss = F.mse_loss(logits, targets.float())
+                probs = torch.sigmoid(logits)
             elif self.hparams.num_classes == 2:
                 loss = F.mse_loss(logits[:, 0], targets.float())
+                probs = F.softmax(logits, dim=1)
             else:
                 raise ValueError("MSE is only an option for binary classification.")
 
