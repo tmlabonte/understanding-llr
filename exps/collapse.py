@@ -280,9 +280,6 @@ class FeatureCollapseResNet(ResNet):
             intra_class_cov = torch.nan_to_num(intra_class_cov, nan=0.0)
             inter_class_cov = torch.nan_to_num(inter_class_cov, nan=0.0)
 
-            # Switch to different linear algebra backend
-            torch.backends.cuda.preferred_linalg_library('MAGMA')
-
             # The problematic line
             class_trace = (intra_class_cov * torch.linalg.pinv(inter_class_cov, hermitian=True).t()).sum() / self.hparams.num_classes
             
@@ -307,9 +304,6 @@ class FeatureCollapseResNet(ResNet):
             # Handle NaN values if found
             intra_group_cov = torch.nan_to_num(intra_group_cov, nan=0.0)
             inter_group_cov = torch.nan_to_num(inter_group_cov, nan=0.0)
-
-            # Switch to different linear algebra backend
-            torch.backends.cuda.preferred_linalg_library('MAGMA')
 
             # The problematic line
             group_trace = (intra_group_cov * torch.linalg.pinv(inter_group_cov, hermitian=True).t()).sum() / self.hparams.num_classes
@@ -597,5 +591,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     args.train_type = "erm"
-    args.results_pkl = f"{args.datamodule}_{args.model}.pkl"
+    args.results_pkl = f"{args.datamodule}_{args.model}_collapse.pkl"
     experiment(args, models[args.model], datamodules[args.datamodule])
