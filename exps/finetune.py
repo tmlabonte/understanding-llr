@@ -297,6 +297,8 @@ if __name__ == "__main__":
                help="The split to train on; either the train set or the combined train and held-out set.")
     parser.add("--train_pct", default=100, type=int,
                help="The percentage of the train set to utilize (for ablations)")
+    parser.add("--num_classes", default=None, type=int,
+               help="The number of outputs produced by the model.")
 
     datamodules = {
         "celeba": CelebARetrain,
