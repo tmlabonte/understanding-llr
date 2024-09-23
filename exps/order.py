@@ -1,4 +1,4 @@
-"""Main file for ERM finetuning under spurious correlations."""
+"""Main file for sample-ordering experiments."""
 
 # Ignores nuisance warnings. Must be called first.
 from milkshake.utils import ignore_warnings
@@ -11,82 +11,23 @@ import pickle
 # Imports Python packages.
 from configargparse import Parser
 import numpy as np
+from numpy.random import default_rng
 
 # Imports PyTorch packages.
 import torch
 from pytorch_lightning import Trainer
 
 # Imports milkshake packages.
+from exps.finetune import *
 from milkshake.args import add_input_args
-from milkshake.datamodules.celeba import CelebA
-from milkshake.datamodules.civilcomments import CivilComments
-from milkshake.datamodules.multinli import MultiNLI
-from milkshake.datamodules.retrain import Retrain
-from milkshake.datamodules.waterbirds import Waterbirds
+from milkshake.datamodules.datamodule import DataModule
+from milkshake.datamodules.dataset import Subset
 from milkshake.main import main
-from milkshake.models.bert import BERT
-from milkshake.models.convnextv2 import ConvNeXtV2
-from milkshake.models.resnet import ResNet
 from milkshake.utils import to_np
 
+ORDER_RATIOS = [0.0, 0.5, 1.0]
 
-METRICS = ["test_aa", "test_acc_by_class", "test_acc_by_group",
-            "test_wca", "test_wga", "train_aa", "train_acc_by_class",
-            "train_acc_by_group", "train_wca", "train_wga", "version"]
-SEEDS = [1, 2, 3]
-TRAIN_TYPES = ["erm", "llr", "dfr"]
-
-# Defines class-balancing methods by dataset.
-base_methods = ["none", "subsetting", "upsampling", "upweighting"]
-def mixtures(ratios):
-    return [f"mixture{j}" for j in ratios]
-CLASS_BALANCING = {
-    "celeba":        base_methods + mixtures([2., 4.]),
-    "civilcomments": base_methods + mixtures([3., 5.]),
-    "multinli":      ["none"],
-    "waterbirds":    base_methods + mixtures([2.]),
-}
-
-# Defines training epochs by dataset and pretraining type.
-EPOCHS = {
-    "celeba": list(range(2, 21, 2)),
-    "civilcomments": list(range(2, 21, 2)),
-    "multinli": list(range(2, 21, 2)),
-    "waterbirds": list(range(10, 101, 10)),
-}
-
-# Defines parameters for preset model sizes.
-VERSIONS = {
-    "bert": ["tiny", "mini", "small", "medium", "base"],
-    "convnextv2": ["atto", "femto", "pico", "nano", "tiny", "base"],
-    "resnet": [18, 34, 50, 101, 152],
-}
-
-class CelebARetrain(CelebA, Retrain):
-    """DataModule for the CelebARetrain dataset."""
-
-    def __init__(self, args, **kwargs):
-        super().__init__(args, **kwargs)
-
-class CivilCommentsRetrain(CivilComments, Retrain):
-    """DataModule for the CivilCommentsRetrain dataset."""
-
-    def __init__(self, args, **kwargs):
-        super().__init__(args, **kwargs)
-
-class MultiNLIRetrain(MultiNLI, Retrain):
-    """DataModule for the MultiNLIRetrain dataset."""
-
-    def __init__(self, args, **kwargs):
-        super().__init__(args, **kwargs)
-
-class WaterbirdsRetrain(Waterbirds, Retrain):
-    """DataModule for the WaterbirdsRetrain dataset."""
-
-    def __init__(self, args, **kwargs):
-        super().__init__(args, **kwargs)
-
-def log_results_helper(
+def log_results(
     args,
     epoch,
     version,
@@ -135,29 +76,6 @@ def log_results_helper(
         results[prefix + "acc_by_class"] = list(to_np(acc_by_class))  # Optionally add class accuracies to results
 
     results["version"] = version
-
-    return results
-
-def log_results(
-    args,
-    epoch,
-    version,
-    validation_step_outputs,
-    weight_aa_by_proportion=False,
-):
-    """Exports validation accuracies to dict and dumps to disk.
-
-    This setup makes it easy to overwrite dump_results in another exp
-    if one wants to add a new key to the results dict.
-    """
-
-    results = log_results_helper(
-        args,
-        epoch,
-        version,
-        validation_step_outputs,
-        weight_aa_by_proportion=weight_aa_by_proportion,
-    )
     dump_results(args, epoch, results)
 
 class BERTWithLogging(BERT):
@@ -201,7 +119,8 @@ class ResNetWithLogging(ResNet):
         super().validation_epoch_end(validation_step_outputs)
         log_results(
             self.hparams,
-            self.current_epoch + 1,
+            #self.current_epoch + 1,
+            (self.current_epoch + 1) * 10,
             self.trainer.logger.version, 
             validation_step_outputs,
             weight_aa_by_proportion=self.hparams.datamodule == "waterbirds",
@@ -217,24 +136,16 @@ def load_results(args):
         results = {}
         for s in SEEDS:
             results[s] = {}
-            for v in VERSIONS[args.model]:
-                results[s][v] = {}
-                for c in CLASS_BALANCING[args.datamodule]:
-                    results[s][v][c] = {}
-                    for t in TRAIN_TYPES:
-                        results[s][v][c][t] = {}
-                        epochs = EPOCHS[args.datamodule]
-                        if t == "erm":
-                            for e in epochs:
-                                results[s][v][c][t][e] = {}
-                                for m in METRICS:
-                                    results[s][v][c][t][e][m] = {}
-                        else:
-                            for d in CLASS_BALANCING[args.datamodule]:
-                                results[s][v][c][t][d] = {}
-                                results[s][v][c][t][d][epochs[-1]] = {}
-                                for m in METRICS:
-                                    results[s][v][c][t][d][epochs[-1]][m] = {}
+            for r in ORDER_RATIOS:
+                results[s][r] = {}
+                for v in VERSIONS[args.model]:
+                    results[s][r][v] = {}
+                    for c in CLASS_BALANCING[args.datamodule]:
+                        results[s][r][v][c] = {}
+                        for e in EPOCHS[args.datamodule]:
+                            results[s][r][v][c][e] = {}
+                            for m in METRICS:
+                                results[s][r][v][c][e][m] = {}
 
         with open(args.results_pkl, "wb") as f:
             pickle.dump(results, f)
@@ -245,6 +156,7 @@ def dump_results(args, curr_epoch, curr_results):
     """Saves metrics in curr_results to the results file."""
 
     s = args.seed
+    r = args.order_ratio
 
     if args.model == "bert":
         v = args.bert_version
@@ -259,23 +171,63 @@ def dump_results(args, curr_epoch, curr_results):
         c += str(args.mixture_ratio)
     if "mixture" in d:
         d += str(args.mixture_ratio)
-    t = args.train_type
     e = curr_epoch
 
     # VERY important to load results right before dumping. Otherwise, we may
     # overwrite results saved by different experiments.
     results = load_results(args)
-    if t == "erm":
-        for m in METRICS:
-            if m in curr_results:
-                results[s][v][c][t][e][m] = curr_results[m]
-    else:
-        for m in METRICS:
-            if m in curr_results:
-                results[s][v][c][t][d][e][m] = curr_results[m]
+    for m in METRICS:
+        if m in curr_results:
+            results[s][r][v][c][e][m] = curr_results[m]
     
     with open(args.results_pkl, "wb") as f:
         pickle.dump(results, f)
+
+class WaterbirdsRetrainOrder(WaterbirdsRetrain):
+    """DataModule for manipulating sample order during training."""
+    
+    def __init__(self, args, **kwargs):
+        super().__init__(args, **kwargs)
+
+        # Number between 0 and 1 controlling order of maj/min class samples.
+        # 0.0: All class 0 first
+        # 0.5: Uniformly random
+        # 1.0: All class 1 first
+        self.order_ratio = args.order_ratio
+
+    def order_helper(self, indices, targets):
+        """Sets sample order as desired. Only works with two classes for now."""
+
+        indices, targets = super()._shuffle_in_unison(indices, targets)
+        
+        class0 = indices[targets == 0]
+        class1 = indices[targets == 1]
+
+        if self.order_ratio == 0.0:
+            return np.concatenate((class0, class1))
+        elif self.order_ratio == 0.5:
+            return indices
+        elif self.order_ratio == 1.0:
+            return np.concatenate((class1, class0))
+        else:
+            raise NotImplementedError()
+
+        return subset
+
+    def train_dataloader(self):
+        # Makes class-balanced subset if specified.
+        self.balanced_sampler = False
+        self.shuffle = False
+        if self.balance_erm == "subsetting":
+            self.dataset_train = self.make_balanced_subset(self.dataset_train)
+
+        indices = self.dataset_train.train_indices
+        targets = self.dataset_train.targets[indices][:, 0] # Removes group dimension
+
+        subset = self.order_helper(indices, targets)
+
+        self.dataset_train = Subset(self.dataset_train, subset) # Just a re-ordering
+        return DataModule.train_dataloader(self)
 
 def experiment(args, model_class, datamodule_class):
     """Runs main training and evaluation procedure."""
@@ -296,7 +248,11 @@ def experiment(args, model_class, datamodule_class):
     if not osp.isfile(args.results_pkl):
         load_results(args)
 
-    main(args, model_class, datamodule_class)
+    args.num_classes = 2 if not args.datamodule == "multinli" else 3
+    args.num_groups = args.num_classes * 2
+    model = model_class(args)
+
+    main(args, model, datamodule_class)
     
 if __name__ == "__main__":
     parser = Parser(
@@ -320,14 +276,13 @@ if __name__ == "__main__":
                help="The split to train on; either the train set or the combined train and held-out set.")
     parser.add("--train_pct", default=100, type=int,
                help="The percentage of the train set to utilize (for ablations)")
-    parser.add("--num_classes", default=None, type=int,
-               help="The number of outputs produced by the model.")
+
+    parser.add("--order_ratio", type=float, default=0.5)
 
     datamodules = {
-        "celeba": CelebARetrain,
-        "civilcomments": CivilCommentsRetrain,
-        "multinli": MultiNLIRetrain,
-        "waterbirds": WaterbirdsRetrain,
+        #"celeba": CelebARetrainOrder,
+        #"civilcomments": CivilCommentsRetrainOrder,
+        "waterbirds": WaterbirdsRetrainOrder,
     }
     models = {
         "bert": BERTWithLogging,
@@ -337,5 +292,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     args.train_type = "erm"
-    args.results_pkl = f"{args.datamodule}_{args.model}.pkl"
+    args.results_pkl = f"{args.datamodule}_{args.model}_order.pkl"
     experiment(args, models[args.model], datamodules[args.datamodule])
