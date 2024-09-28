@@ -107,6 +107,8 @@ def add_input_args(parser):
                help="The momentum value to utilize with the SGD optimizer.")
     parser.add("--no_test", default=False, type=lambda x: bool(strtobool(x)),
                help="Whether to skip the test phase (only run train and val)")
+    parser.add("--num_classes", default=2, type=int,
+               help="The number of classes to use for model output.")
     parser.add("--num_workers", default=4, type=int,
                help="The number of sub-processes to use for data loading.")
     parser.add("--optimizer", choices=["adam", "adamw", "sgd"], default="sgd",

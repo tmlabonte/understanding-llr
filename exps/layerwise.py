@@ -43,8 +43,9 @@ def experiment(args, model_class, datamodule_class):
     if not osp.isfile(args.results_pkl):
         load_results(args)
 
-    args.num_classes = 2 if not args.datamodule == "multinli" else 3
-    args.num_groups = args.num_classes * 2
+    if args.num_classes == None:
+        args.num_classes = 2 if not args.datamodule == "multinli" else 3
+    args.num_groups = 4 if not args.datamodule == "multinli" else 6
     model = model_class(args)
 
     try:

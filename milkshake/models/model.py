@@ -305,6 +305,7 @@ class Model(pl.LightningModule):
         # Computes loss and prediction probabilities.
         if self.hparams.loss == "cross_entropy":
             if self.hparams.num_classes == 1:
+                targets = targets.float()
                 loss = F.binary_cross_entropy_with_logits(logits, targets, weight=weights)
                 probs = torch.sigmoid(logits)
             else:
