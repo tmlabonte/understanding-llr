@@ -164,9 +164,11 @@ class Retrain(DataModule):
                 new_retrain_inds = new_combined_inds[train_num:]
         else:
             if self.split == "train" and self.train_pct == 100:
-                # Performs LLR on entire training set.
+                # Performs LLR on a subset of the training set.
+                # Keeps data quantity constant for comparison with held-out LLR.
+                default_rng(seed=self.seed).shuffle(train_inds)
                 new_train_inds = train_inds
-                new_retrain_inds = train_inds
+                new_retrain_inds = train_inds[:retrain_num]
             elif self.split == "train":
                 raise NotImplementedError()
             elif self.split == "combined":
