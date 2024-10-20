@@ -12,6 +12,7 @@ import pickle
 
 # Imports Python packages.
 from configargparse import Parser
+from distutils.util import strtobool
 import numpy as np
 
 # Imports PyTorch packages.
