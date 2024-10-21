@@ -291,7 +291,7 @@ def experiment(args, model_class, datamodule_class):
         main(args, model_class, datamodule_class)
     elif args.train_type == "llr":
         find_erm_weights(args)
-        
+        print(args)
         datamodule = datamodule_class(args)
         datamodule.setup()
 
