@@ -22,6 +22,7 @@ class Retrain(DataModule):
 
         self.balance_erm = args.balance_erm
         self.balance_retrain = args.balance_retrain
+        self.heldout = args.heldout
         self.mixture_ratio = args.mixture_ratio
         self.retrain_type = args.retrain_type if hasattr(args, "retrain_type") else "erm"
         self.split = args.split
@@ -142,24 +143,36 @@ class Retrain(DataModule):
         retrain_num = int(self.heldout_pct * len(val_inds))
         new_val_inds = val_inds[retrain_num:]
 
-        if self.split == "train" and self.train_pct == 100:
-            new_train_inds = train_inds
-            new_retrain_inds = val_inds[:retrain_num]
-        elif self.split == "train":
-            default_rng(seed=self.seed).shuffle(train_inds)
-            train_num = int(len(train_inds) * self.train_pct / 100)
-            new_train_inds = train_inds[:train_num]
-            new_retrain_inds = train_inds[train_num:]
-        elif self.split == "combined":
-            combined_inds = np.concatenate((train_inds, val_inds))
-            train_num = int((len(train_inds) + retrain_num) * self.train_pct / 100)
-            new_retrain_num = len(combined_inds) - \
-                    int((1 - self.heldout_pct) * len(val_inds))
-            new_combined_inds = combined_inds[:new_retrain_num]
-
-            default_rng(seed=self.seed).shuffle(new_combined_inds)
-            new_train_inds = new_combined_inds[:train_num]
-            new_retrain_inds = new_combined_inds[train_num:]
+        if self.heldout:
+            if self.split == "train" and self.train_pct == 100:
+                new_train_inds = train_inds
+                new_retrain_inds = val_inds[:retrain_num]
+            elif self.split == "train":
+                default_rng(seed=self.seed).shuffle(train_inds)
+                train_num = int(len(train_inds) * self.train_pct / 100)
+                new_train_inds = train_inds[:train_num]
+                new_retrain_inds = train_inds[train_num:]
+            elif self.split == "combined":
+                combined_inds = np.concatenate((train_inds, val_inds))
+                train_num = int((len(train_inds) + retrain_num) * self.train_pct / 100)
+                new_retrain_num = len(combined_inds) - \
+                        int((1 - self.heldout_pct) * len(val_inds))
+                new_combined_inds = combined_inds[:new_retrain_num]
+    
+                default_rng(seed=self.seed).shuffle(new_combined_inds)
+                new_train_inds = new_combined_inds[:train_num]
+                new_retrain_inds = new_combined_inds[train_num:]
+        else:
+            if self.split == "train" and self.train_pct == 100:
+                # Performs LLR on a subset of the training set.
+                # Keeps data quantity constant for comparison with held-out LLR.
+                default_rng(seed=self.seed).shuffle(train_inds)
+                new_train_inds = train_inds
+                new_retrain_inds = train_inds[:retrain_num]
+            elif self.split == "train":
+                raise NotImplementedError()
+            elif self.split == "combined":
+                raise NotImplementedError()
 
         dataset_train = Subset(dataset_train, new_train_inds)
         dataset_retrain = Subset(dataset_val, new_retrain_inds)

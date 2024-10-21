@@ -10,6 +10,7 @@ import pickle
 
 # Imports Python packages.
 from configargparse import Parser
+from distutils.util import strtobool
 import numpy as np
 
 # Imports PyTorch packages.
@@ -312,6 +313,8 @@ if __name__ == "__main__":
                help="Which type of class-balancing to perform during ERM training.")
     parser.add("--balance_retrain", choices=["mixture", "none", "subsetting", "upsampling", "upweighting"], default="none",
                help="Which type of class-balancing to perform during retraining.")
+    parser.add("--heldout", default=True, type=lambda x: bool(strtobool(x)),
+               help="Whether to perform LLR on a held-out set or the training set.")
     parser.add("--mixture_ratio", type=float, default=1,
                help="The largest acceptable class imbalance ratio for the mixture balancing strategy.")
     parser.add("--save_retrained_model", action="store_true",
@@ -320,8 +323,8 @@ if __name__ == "__main__":
                help="The split to train on; either the train set or the combined train and held-out set.")
     parser.add("--train_pct", default=100, type=int,
                help="The percentage of the train set to utilize (for ablations)")
-    parser.add("--num_classes", default=None, type=int,
-               help="The number of outputs produced by the model.")
+    #parser.add("--num_classes", default=None, type=int,
+    #           help="The number of outputs produced by the model.")
 
     datamodules = {
         "celeba": CelebARetrain,
