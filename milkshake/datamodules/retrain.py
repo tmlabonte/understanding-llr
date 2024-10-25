@@ -231,9 +231,9 @@ class Retrain(DataModule):
         """Returns a group-balanced DataLoader."""
 
         if balance == "upsampling":
+            groups = self._make_groups_array(indices)
             counts = np.bincount(groups)
             label_weights = 1. / counts
-            groups = self._make_groups_array(indices)
             weights = label_weights[groups]
             sampler = WeightedRandomSampler(weights, len(weights))
             return self._data_loader(self.dataset_train, sampler=sampler)
