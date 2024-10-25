@@ -13,14 +13,10 @@ from torch.optim import Adam, AdamW, SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, MultiStepLR
 
 # Imports milkshake packages.
-from milkshake.utils import compute_accuracy
-# Imports from other modules
 from milkshake.models.logger import Logger  
+from milkshake.utils import compute_accuracy
 
-
-# TODO: Organize logging code in a separate file.
 # TODO: Implement after_n_steps logging similarly to after_epoch.
-# TODO: Clean up collate_metrics.
 
 
 class Model(pl.LightningModule):
@@ -28,6 +24,7 @@ class Model(pl.LightningModule):
 
     Attributes:
         self.hparams: The configuration dictionary.
+        self.milkshake_logger: A milkshake.Logger.
         self.model: A torch.nn.Module.
         self.optimizer: A torch.optim optimizer.
     """
@@ -181,7 +178,6 @@ class Model(pl.LightningModule):
         # Computes loss and prediction probabilities.
         if self.hparams.loss == "cross_entropy":
             if self.hparams.num_classes == 1:
-                targets = targets.float()
                 loss = F.binary_cross_entropy_with_logits(logits, targets, weight=weights)
                 probs = torch.sigmoid(logits)
             else:
@@ -251,7 +247,6 @@ class Model(pl.LightningModule):
 
         self.collate_metrics(training_step_outputs, "train")
 
-
     def validation_step(self, batch, idx, dataloader_idx=0):
         """Performs a single validation step.
 
@@ -317,5 +312,3 @@ class Model(pl.LightningModule):
             preds = torch.argmax(probs, dim=1)
 
         return preds
-
-
