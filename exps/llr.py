@@ -104,15 +104,15 @@ def find_erm_weights(args):
     elif args.model == "resnet":
         v = args.resnet_version
 
+    p = args.split
     c = args.balance_erm
-    d = args.balance_retrain
     if "mixture" in c:
         c += str(args.mixture_ratio)
     if "mixture" in d:
         d += str(args.mixture_ratio)
     e = args.max_epochs
 
-    wandb_version = results[s][v][c]["erm"][e]["version"]
+    wandb_version = results[s][v][p][c]["erm"][e]["version"]
     if not wandb_version:
         raise ValueError(f"Model version {wandb_version} not found.")
 
