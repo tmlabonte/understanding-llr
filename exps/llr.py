@@ -137,6 +137,7 @@ def experiment(args, model_class, datamodule_class):
     model = model_class(args)
     model = load_weights(args, model)
 
+    """
     # Performs LLR.
     new_args = set_llr_args(args, "llr")
     model.hparams.train_type = "llr" # Used for dumping results
@@ -145,13 +146,13 @@ def experiment(args, model_class, datamodule_class):
         new_args, model, datamodule_class, model_hooks=[reset_fc_hook])
 
     """
-    # Performs DFR.
+    # Performs DFR.s (deep feature reweighting)
     new_args = set_llr_args(args, "dfr")
     model.hparams.train_type = "dfr" # Used for dumping results
     train_fc_only(model)
     model, _, _ = main(
         new_args, model, datamodule_class, model_hooks=[reset_fc_hook])
-    """
+    
 
 if __name__ == "__main__":
     parser = Parser(
