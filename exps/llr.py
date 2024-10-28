@@ -108,8 +108,6 @@ def find_erm_weights(args):
     c = args.balance_erm
     if "mixture" in c:
         c += str(args.mixture_ratio)
-    if "mixture" in d:
-        d += str(args.mixture_ratio)
     e = args.max_epochs
 
     wandb_version = results[s][v][p][c]["erm"][e]["version"]
