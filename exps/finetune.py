@@ -31,10 +31,12 @@ from milkshake.models.resnet import ResNet
 from milkshake.utils import to_np
 
 
+HELDOUTS = [True, False]
 METRICS = ["test_aa", "test_acc_by_class", "test_acc_by_group",
             "test_wca", "test_wga", "train_aa", "train_acc_by_class",
             "train_acc_by_group", "train_wca", "train_wga", "version"]
 SEEDS = [1, 2, 3]
+SPLITS = ["combined", "train"]
 TRAIN_TYPES = ["erm", "llr", "dfr"]
 
 # Defines class-balancing methods by dataset.
@@ -220,22 +222,26 @@ def load_results(args):
             results[s] = {}
             for v in VERSIONS[args.model]:
                 results[s][v] = {}
-                for c in CLASS_BALANCING[args.datamodule]:
-                    results[s][v][c] = {}
-                    for t in TRAIN_TYPES:
-                        results[s][v][c][t] = {}
-                        epochs = EPOCHS[args.datamodule]
-                        if t == "erm":
-                            for e in epochs:
-                                results[s][v][c][t][e] = {}
-                                for m in METRICS:
-                                    results[s][v][c][t][e][m] = {}
-                        else:
-                            for d in CLASS_BALANCING[args.datamodule]:
-                                results[s][v][c][t][d] = {}
-                                results[s][v][c][t][d][epochs[-1]] = {}
-                                for m in METRICS:
-                                    results[s][v][c][t][d][epochs[-1]][m] = {}
+                for p in SPLITS:
+                    results[s][v][p] = {}
+                    for c in CLASS_BALANCING[args.datamodule]:
+                        results[s][v][p][c] = {}
+                        for t in TRAIN_TYPES:
+                            results[s][v][p][c][t] = {}
+                            epochs = EPOCHS[args.datamodule]
+                            if t == "erm":
+                                for e in epochs:
+                                    results[s][v][p][c][t][e] = {}
+                                    for m in METRICS:
+                                        results[s][v][p][c][t][e][m] = {}
+                            else:
+                                for h in HELDOUTS:
+                                    results[s][v][p][c][t][h] = {}
+                                    for d in CLASS_BALANCING[args.datamodule]:
+                                        results[s][v][p][c][t][h][d] = {}
+                                        results[s][v][p][c][t][h][d][epochs[-1]] = {}
+                                        for m in METRICS:
+                                            results[s][v][p][c][t][h][d][epochs[-1]][m] = {}
 
         with open(args.results_pkl, "wb") as f:
             pickle.dump(results, f)
@@ -254,6 +260,7 @@ def dump_results(args, curr_epoch, curr_results):
     elif args.model == "resnet":
         v = args.resnet_version
         
+    p = args.split
     c = args.balance_erm
     d = args.balance_retrain
     if "mixture" in c:
@@ -261,6 +268,7 @@ def dump_results(args, curr_epoch, curr_results):
     if "mixture" in d:
         d += str(args.mixture_ratio)
     t = args.train_type
+    h = args.heldout
     e = curr_epoch
 
     # VERY important to load results right before dumping. Otherwise, we may
@@ -269,11 +277,11 @@ def dump_results(args, curr_epoch, curr_results):
     if t == "erm":
         for m in METRICS:
             if m in curr_results:
-                results[s][v][c][t][e][m] = curr_results[m]
+                results[s][v][p][c][t][e][m] = curr_results[m]
     else:
         for m in METRICS:
             if m in curr_results:
-                results[s][v][c][t][d][e][m] = curr_results[m]
+                results[s][v][p][c][t][h][d][e][m] = curr_results[m]
     
     with open(args.results_pkl, "wb") as f:
         pickle.dump(results, f)
@@ -323,8 +331,6 @@ if __name__ == "__main__":
                help="The split to train on; either the train set or the combined train and held-out set.")
     parser.add("--train_pct", default=100, type=int,
                help="The percentage of the train set to utilize (for ablations)")
-    #parser.add("--num_classes", default=None, type=int,
-    #           help="The number of outputs produced by the model.")
 
     datamodules = {
         "celeba": CelebARetrain,
