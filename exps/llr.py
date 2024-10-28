@@ -137,21 +137,19 @@ def experiment(args, model_class, datamodule_class):
     model = model_class(args)
     model = load_weights(args, model)
 
-    # Performs LLR.
-    new_args = set_llr_args(args, "llr")
-    model.hparams.train_type = "llr" # Used for dumping results
-    train_fc_only(model)
-    model, _, _ = main(
-        new_args, model, datamodule_class, model_hooks=[reset_fc_hook])
+    if args.retrain_type in ["llr", "both"]:
+        # Performs LLR.
+        new_args = set_llr_args(args, "llr")
+        model.hparams.train_type = "llr" # Used for dumping results
+        train_fc_only(model)
+        main(new_args, model, datamodule_class, model_hooks=[reset_fc_hook])
 
-    """
-    # Performs DFR.
-    new_args = set_llr_args(args, "dfr")
-    model.hparams.train_type = "dfr" # Used for dumping results
-    train_fc_only(model)
-    model, _, _ = main(
-        new_args, model, datamodule_class, model_hooks=[reset_fc_hook])
-    """
+    if args.retrain_type in ["dfr", "both"]:
+        # Performs DFR.
+        new_args = set_llr_args(args, "dfr")
+        model.hparams.train_type = "dfr" # Used for dumping results
+        train_fc_only(model)
+        main(new_args, model, datamodule_class, model_hooks=[reset_fc_hook])
 
 if __name__ == "__main__":
     parser = Parser(
@@ -177,6 +175,9 @@ if __name__ == "__main__":
                help="The split to train on; either the train set or the combined train and held-out set.")
     parser.add("--train_pct", default=100, type=int,
                help="The percentage of the train set to utilize (for ablations)")
+
+    parser.add("--retrain_type", choices=["llr", "dfr", "both"], default="llr",
+               help="Whether to perform LLR, DFR, or both.")
 
     datamodules = {
         "celeba": CelebARetrain,
