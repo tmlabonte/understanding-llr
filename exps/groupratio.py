@@ -14,6 +14,9 @@ import pickle
 from configargparse import Parser
 import numpy as np
 
+# Imports PyTorch packages.
+from torch.utils.data import WeightedRandomSampler
+
 # Imports milkshake packages.
 from exps.finetune import *
 from exps.llr import *
@@ -27,9 +30,10 @@ from milkshake.main import main, load_weights
 
 
 GROUP_RATIOS = {
-    "waterbirds": np.arange(5, 105, 5), # About 5.3 is standard
-    "celeba": np.arange(5, 105, 5), # About 6.1 is standard
+    "celeba": np.arange(0.05, 1.05, 0.05), # About 0.061 is standard
+    "waterbirds": np.arange(0.05, 1.05, 0.05), # About 0.053 is standard
 }
+
 
 class GroupRatio(Retrain):
     def __init__(self, args, *xargs):
@@ -38,61 +42,86 @@ class GroupRatio(Retrain):
         self.retrain_group_ratio = args.retrain_group_ratio
         self.orig_datamodule = args.datamodule
 
-    def make_group_ratio_subset(self, dataset):
-        if self.retrain_type == "erm":
-            group_ratio = self.erm_group_ratio
-            balance = self.balance_erm
-        else:
-            group_ratio = self.retrain_group_ratio
-            balance = self.balance_retrain
+    def make_group_ratio_sampler(self, dataset, group_ratio):
+        """Returns a WeightedRandomSampler with the specified group ratio.
+
+        Class-balancing is always used so that the probability of sampling
+        a point from each class is equal. However, within each class, if there
+        is a minority group then it will be sampled according to the specified
+        group ratio. If there is no minority group in the class, each group
+        will be sampled with equal probability.
+        """
 
         indices = dataset.train_indices
-        groups = dataset.targets[indices][:, 1] # Removes class dimension
-        indices, groups = self._shuffle_in_unison(indices, groups)
-        num = len(dataset.groups)
+        classes, groups = dataset.targets[indices].T
+        group_totals = np.unique(groups, return_counts=True)[1]
 
-        total_by_group = np.unique(groups, return_counts=True)[1]
-        if balance == "none":
-            total_by_class = [
-                2 * min(total_by_group[:2]),
-                2 * min(total_by_group[2:]),
+        minority_pct = group_ratio / (group_ratio + 1)
+        if self.orig_datamodule == "celeba":
+            # Ex. group_ratio 50 => group weights [0.25, 0.25, 0.333, 0.167]
+            weights_by_group = [
+                0.5,
+                0.5,
+                1 - minority_pct,
+                minority_pct,
             ]
-        elif balance == "subsetting":
-            total_by_class = [
-                2 * min(total_by_group),
-                2 * min(total_by_group),
+        elif self.orig_datamodule == "waterbirds":
+            # Ex. group_ratio 50 => group weights [0.333, 0.167, 0.167, 0.333]
+            weights_by_group = [
+                1 - minority_pct,
+                minority_pct,
+                minority_pct,
+                1 - minority_pct,
             ]
 
+        weights = [0] * len(groups)
+        for j, group in enumerate(groups):
+            # Normalizes weights of each individual datum so that the sum
+            # of weights for each group is weights_by_group.
+            weights[j] = weights_by_group[group] / (2 * group_totals[group])
+        print(f"Weights by group: {weights_by_group}")
+
+        return WeightedRandomSampler(weights, len(weights))
+
+    def make_group_ratio_subset(self, dataset, group_ratio):
+        """Returns a Subset with the specified group ratio.
+
+        Class-balancing is always used so that the number of data from each
+        class is equal. However, within each class, if there is a minority group
+        then it will be subsetted according to the specified group ratio. If
+        there is no minority group in the class, each group will have the same
+        number of data.
+        """
+
+        indices = dataset.train_indices
+        classes, groups = dataset.targets[indices].T
+        group_totals = np.unique(groups, return_counts=True)[1]
+        class_totals = np.full(self.num_classes, 2 * group_totals.min())
+
+        minority_pct = group_ratio / (group_ratio + 1)
+        if self.orig_datamodule == "celeba":
+            nums = [
+                class_totals[0] / 2,
+                class_totals[0] / 2,
+                class_totals[1] - class_totals[1] * minority_pct,
+                class_totals[1] * minority_pct,
+            ]
         if self.orig_datamodule == "waterbirds":
             nums = [
-                (group_ratio * total_by_class[0]) / (group_ratio + 100),
-                (group_ratio * total_by_class[1]) / (group_ratio + 100),
-            ]
-            desired = [
-                total_by_class[0] - nums[0],
-                nums[0],
-                nums[1],
-                total_by_class[1] - nums[1],
-            ]
-        elif self.orig_datamodule == "celeba":
-            nums = [
-                total_by_class[0] / 2,
-                (group_ratio * total_by_class[1]) / (group_ratio + 100),
-            ]
-            desired = [
-                nums[0],
-                nums[0],
-                total_by_class[1] - nums[1],
-                nums[1],
+                class_totals[0] - class_totals[0] * minority_pct,
+                class_totals[0] * minority_pct,
+                class_totals[1] * minority_pct,
+                class_totals[1] - class_totals[1] * minority_pct
             ]
 
         subset = []
-        counts = [0] * num
+        counts = [0] * len(group_totals)
+        indices, groups = self._shuffle_in_unison(indices, groups)
         for idx, group in zip(indices, groups):
-            if counts[group] < desired[group]:
+            if counts[group] < nums[group]:
                 subset.append(idx)
                 counts[group] += 1
-        print(f"Data subset: {counts}")
+        print(f"Subsets by group: {counts}")
 
         return Subset(dataset, subset)
 
@@ -100,16 +129,37 @@ class GroupRatio(Retrain):
         """Initializes datasets with no augmentations (for evaluation)."""
         
         super()._initialize_datasets_no_aug(dataset_val)
+
         if self.retrain_type == "erm":
-            self.dataset_train_no_aug = self.make_group_ratio_subset(self.dataset_train_no_aug)
+            if self.balance_erm == "subsetting":
+                self.dataset_train_no_aug = self.make_group_ratio_subset(
+                    self.dataset_train_no_aug,
+                    self.erm_group_ratio,
+                )
         else:
-            self.dataset_retrain_no_aug = self.make_group_ratio_subset(self.dataset_retrain_no_aug)
+            if self.balance_retrain == "subsetting":
+                self.dataset_retrain_no_aug = self.make_group_ratio_subset(
+                    self.dataset_retrain_no_aug,
+                    self.retrain_group_ratio,
+                )
 
     def group_unbalanced_dataloader(self, balance):
-        # Only meant to use subsetting or none.
-        self.dataset_train = self.make_group_ratio_subset(self.dataset_train)
+        if self.retrain_type == "erm":
+            group_ratio = self.erm_group_ratio
+        else:
+            group_ratio = self.retrain_group_ratio
 
-        return DataModule.train_dataloader(self)
+        if balance == "upsampling":
+            sampler = self.make_group_ratio_sampler(
+                    self.dataset_train, group_ratio)
+            return DataModule._data_loader(
+                    self, self.dataset_train, sampler=sampler)
+        elif balance == "subsetting":
+            self.dataset_train = self.make_group_ratio_subset(
+                    self.dataset_train, group_ratio)
+            return DataModule.train_dataloader(self)
+        else:
+            raise NotImplementedError()
 
 class WaterbirdsGroupRatio(Waterbirds, GroupRatio):
     """DataModule for the WaterbirdsGroupRatio dataset."""
@@ -276,11 +326,6 @@ def find_erm_weights(args):
 def experiment(args, model_class, datamodule_class):
     """Runs main training and evaluation procedure."""
 
-    # Only meant to use subsetting or none.
-    if args.balance_erm not in ["none", "subsetting"] \
-        or args.balance_retrain not in ["none", "subsetting"]:
-        return NotImplementedError()
-
     args.no_test = True
 
     # Creates results dict if it does not exist.
@@ -291,7 +336,6 @@ def experiment(args, model_class, datamodule_class):
         main(args, model_class, datamodule_class)
     elif args.train_type == "llr":
         find_erm_weights(args)
-        print(args)
         datamodule = datamodule_class(args)
         datamodule.setup()
 
@@ -321,6 +365,8 @@ if __name__ == "__main__":
                help="Which type of class-balancing to perform during ERM training.")
     parser.add("--balance_retrain", choices=["mixture", "none", "subsetting", "upsampling", "upweighting"], default="none",
                help="Which type of class-balancing to perform during retraining.")
+    parser.add("--heldout", default=True, type=lambda x: bool(strtobool(x)),
+               help="Whether to perform LLR on a held-out set or the training set.")
     parser.add("--mixture_ratio", type=float, default=1,
                help="The largest acceptable class imbalance ratio for the mixture balancing strategy.")
     parser.add("--save_retrained_model", action="store_true",
@@ -329,13 +375,11 @@ if __name__ == "__main__":
                help="The split to train on; either the train set or the combined train and held-out set.")
     parser.add("--train_pct", default=100, type=int,
                help="The percentage of the train set to utilize (for ablations)")
-    parser.add("--num_classes", default=None, type=int,
-               help="The number of outputs produced by the model.")
 
-    parser.add("--erm_group_ratio", default=100, type=int,
-               help="The percent of minority group data to include in ERM.")
-    parser.add("--retrain_group_ratio", default=100, type=int,
-               help="The percent of minority group data to include in LLR.")
+    parser.add("--erm_group_ratio", default=1, type=float,
+               help="The ratio of minority to majority group data in ERM.")
+    parser.add("--retrain_group_ratio", default=1, type=float,
+               help="The ratio of minority to majority group data in LLR.")
     parser.add("--train_type", choices=["erm", "llr"], default="erm",
                help="Whether to perform ERM or LLR.")
 
@@ -351,4 +395,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args.retrain_type = args.train_type
     args.results_pkl = f"{args.datamodule}_{args.model}_groupratio.pkl"
+
+    # Checks legitimacy of group ratio arguments.
+    if args.erm_group_ratio > 1 or args.retrain_group_ratio > 1:
+        raise ValueError("Cannot have more minority group data than majority group data.")
+
     experiment(args, models[args.model], datamodules[args.datamodule])
