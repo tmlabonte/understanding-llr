@@ -5,7 +5,7 @@ import numpy as np
 
 # Configuration
 seeds = [1, 2, 3]
-balance_retrain = ["none", "subsetting","upsampling"]
+balance_retrain = ["upsampling"]
 
 datasets = {
     "celeba": "celeba_resnet.pkl",
@@ -39,18 +39,18 @@ def process_values(results, erm_results, llr_results, dfr_results, retrain_key_e
     aa_llr_values, aa_erm_values, aa_dfr_values = [], [], []
 
     test_epoch = 100 if dataset == "waterbirds" else 20
-    version = "mini" if dataset =='civilcomments' else 18
+    version = "base" if dataset =='civilcomments' else 50
     for s in seeds:
         try:
             # WGA Values
-            wga_llr_values.append(llr_results[s][version][retrain_key_llr]["llr"][retrain_key_llr][test_epoch]["test_wga"])
-            wga_erm_values.append(erm_results[s][version][retrain_key_erm]["erm"][test_epoch]["test_wga"])
-          #  wga_dfr_values.append(dfr_results[s][version][retrain_key_dfr]["dfr"]["subsetting"][test_epoch]["test_wga"])
+            wga_llr_values.append(llr_results[s][version]["train"]["subsetting"]["llr"][False]["upsampling"][test_epoch]["test_wga"])
+            wga_erm_values.append(erm_results[s][version]["train"]["subsetting"]["erm"][test_epoch]["test_wga"])
+            wga_dfr_values.append(dfr_results[s][version]["train"]["subsetting"]["dfr"][False]["upsampling"][test_epoch]["test_wga"])
 
             # AA Values
-            aa_llr_values.append(llr_results[s][version][retrain_key_llr]["llr"][retrain_key_llr][test_epoch]["test_aa"])
-            aa_erm_values.append(erm_results[s][version][retrain_key_erm]["erm"][test_epoch]["test_aa"])
-            aa_dfr_values.append(dfr_results[s][version][retrain_key_dfr]["dfr"]["subsetting"][test_epoch]["test_aa"])
+            aa_llr_values.append(llr_results[s][version]["train"]["subsetting"]["llr"][False]["upsampling"][test_epoch]["test_aa"])
+            aa_erm_values.append(erm_results[s][version]["train"]["subsetting"]["erm"][test_epoch]["test_aa"])
+            aa_dfr_values.append(dfr_results[s][version]["train"]["subsetting"]["dfr"][False]["upsampling"][test_epoch]["test_aa"])
 
         except KeyError as e:
             print(f"KeyError for {dataset} - {retrain_key_erm} with seed {s}: {e}")
@@ -98,10 +98,11 @@ def process_layerwise_models(dataset, erm_filepath, llr_filepath, dfr_filepath):
         dfr_mean_aa, dfr_std_aa = calculate_statistics(aa_dfr_values)
 
         print(f"{dataset} - {retrain}")
-        print(f"WGA: LLR {llr_mean_wga:.4f} +/- {llr_std_wga:.4f}, ERM {erm_mean_wga:.4f} +/- {erm_std_wga:.4f}, DFR {dfr_mean_wga:.4f} +/- {dfr_std_wga:.4f}")
-        print(f"AA: LLR {llr_mean_aa:.4f} +/- {llr_std_aa:.4f}, ERM {erm_mean_aa:.4f} +/- {erm_std_aa:.4f}, DFR {dfr_mean_aa:.4f} +/- {dfr_std_aa:.4f}")
+        print(f"WGA: LLR {llr_mean_wga * 100:.2f}% +/- {llr_std_wga * 100:.2f}%, ERM {erm_mean_wga * 100:.2f}% +/- {erm_std_wga * 100:.2f}%, DFR {dfr_mean_wga * 100:.2f}% +/- {dfr_std_wga * 100:.2f}%")
+        print(f"AA: LLR {llr_mean_aa * 100:.2f}% +/- {llr_std_aa * 100:.2f}%, ERM {erm_mean_aa * 100:.2f}% +/- {erm_std_aa * 100:.2f}%, DFR {dfr_mean_aa * 100:.2f}% +/- {dfr_std_aa * 100:.2f}%")
+
 
 # Process each dataset
 process_layerwise_models("celeba", "/home/xzhang941/understanding-llr/celeba_resnet.pkl", "/home/xzhang941/understanding-llr/celeba_resnet.pkl", "/home/xzhang941/understanding-llr/celeba_resnet.pkl")
-process_layerwise_models("waterbirds", "/home/xzhang941/understanding-llr/waterbirds_resnet.pkl", "/home/xzhang941/understanding-llr/waterbirds_resnet.pkl", "/home/xzhang941/understanding-llr/waterbirds_resnet.pkl")
+#process_layerwise_models("waterbirds", "/home/xzhang941/understanding-llr/waterbirds_resnet.pkl", "/home/xzhang941/understanding-llr/waterbirds_resnet.pkl", "/home/xzhang941/understanding-llr/waterbirds_resnet.pkl")
 process_layerwise_models("civilcomments", "/home/xzhang941/understanding-llr/civilcomments_bert.pkl", "/home/xzhang941/understanding-llr/civilcomments_bert.pkl", "/home/xzhang941/understanding-llr/civilcomments_bert.pkl")
