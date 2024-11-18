@@ -103,6 +103,6 @@ def process_layerwise_models(dataset, erm_filepath, llr_filepath, dfr_filepath):
 
 
 # Process each dataset
-process_layerwise_models("celeba", "/home/xzhang941/understanding-llr/celeba_resnet.pkl", "/home/xzhang941/understanding-llr/celeba_resnet.pkl", "/home/xzhang941/understanding-llr/celeba_resnet.pkl")
-#process_layerwise_models("waterbirds", "/home/xzhang941/understanding-llr/waterbirds_resnet.pkl", "/home/xzhang941/understanding-llr/waterbirds_resnet.pkl", "/home/xzhang941/understanding-llr/waterbirds_resnet.pkl")
-process_layerwise_models("civilcomments", "/home/xzhang941/understanding-llr/civilcomments_bert.pkl", "/home/xzhang941/understanding-llr/civilcomments_bert.pkl", "/home/xzhang941/understanding-llr/civilcomments_bert.pkl")
+#process_layerwise_models("celeba", "/home/xzhang941/understanding-llr/celeba_resnet.pkl", "/home/xzhang941/understanding-llr/celeba_resnet.pkl", "/home/xzhang941/understanding-llr/celeba_resnet.pkl")
+process_layerwise_models("waterbirds", "/home/xzhang941/understanding-llr/waterbirds_resnet.pkl", "/home/xzhang941/understanding-llr/waterbirds_resnet.pkl", "/home/xzhang941/understanding-llr/waterbirds_resnet.pkl")
+#process_layerwise_models("civilcomments", "/home/xzhang941/understanding-llr/civilcomments_bert.pkl", "/home/xzhang941/understanding-llr/civilcomments_bert.pkl", "/home/xzhang941/understanding-llr/civilcomments_bert.pkl")

@@ -4,6 +4,7 @@
 from milkshake.utils import ignore_warnings
 ignore_warnings()
 
+
 # Imports Python builtins.
 from copy import deepcopy
 from glob import glob
@@ -26,12 +27,14 @@ from milkshake.datamodules.datamodule import DataModule
 from milkshake.datamodules.dataset import Subset
 from milkshake.datamodules.retrain import Retrain
 from milkshake.datamodules.waterbirds import Waterbirds
+from milkshake.datamodules.civilcomments import CivilComments
 from milkshake.main import main, load_weights
 
 
 GROUP_RATIOS = {
     "celeba": np.arange(0.05, 1.05, 0.05), # About 0.061 is standard
     "waterbirds": np.arange(0.05, 1.05, 0.05), # About 0.053 is standard
+    "civilcomments": np.arange(0.05, 1.05, 0.05),
 }
 
 
@@ -73,6 +76,15 @@ class GroupRatio(Retrain):
                 minority_pct,
                 1 - minority_pct,
             ]
+        
+        elif self.orig_datamodule == "civilcomments":
+            # Ex. group_ratio 50 => group weights [0.333, 0.167, 0.167, 0.333]
+            weights_by_group = [
+                1 - minority_pct,
+                minority_pct,
+                minority_pct,
+                1 - minority_pct,
+            ]
 
         weights = [0] * len(groups)
         for j, group in enumerate(groups):
@@ -107,6 +119,14 @@ class GroupRatio(Retrain):
                 class_totals[1] * minority_pct,
             ]
         if self.orig_datamodule == "waterbirds":
+            nums = [
+                class_totals[0] - class_totals[0] * minority_pct,
+                class_totals[0] * minority_pct,
+                class_totals[1] * minority_pct,
+                class_totals[1] - class_totals[1] * minority_pct
+            ]
+
+        if self.orig_datamodule == "civilcomments":
             nums = [
                 class_totals[0] - class_totals[0] * minority_pct,
                 class_totals[0] * minority_pct,
@@ -172,6 +192,13 @@ class CelebAGroupRatio(CelebA, GroupRatio):
 
     def __init__(self, args, **kwargs):
         super().__init__(args, **kwargs)
+
+class CivilCommentsGroupRatio(CivilComments, GroupRatio):
+    """DataModule for the CivilCommentsGroupRatio dataset."""
+
+    def __init__(self, args, **kwargs):
+        super().__init__(args, **kwargs)
+
 
 def load_results(args):
     """Loads results file or creates it if it does not exist."""
@@ -286,6 +313,27 @@ class ResNetWithLogging(ResNet):
             validation_step_outputs,
             weight_aa_by_proportion=self.hparams.datamodule == "waterbirds",
         )
+class BertWithLogging(BERT):
+    """Quick and dirty extension of Bert with metrics exported to dict."""
+
+    def __init__(self, args, **kwargs):
+        super().__init__(args, **kwargs)
+
+    def validation_epoch_end(self, validation_step_outputs):
+        """
+        Hook to execute at the end of a validation epoch, allowing logging of results.
+        """
+        super().validation_epoch_end(validation_step_outputs)
+
+        
+        log_results(
+            self.hparams,
+            self.current_epoch + 1,
+            self.trainer.logger.version,
+            validation_step_outputs,
+              
+        )
+
 
 def find_erm_weights(args):
     """Retrieves ERM weights from pickle file based on model config."""
@@ -386,10 +434,12 @@ if __name__ == "__main__":
     datamodules = {
         "waterbirds": WaterbirdsGroupRatio,
         "celeba": CelebAGroupRatio,
+        "civilcomments": CivilCommentsGroupRatio,
     }
     models = {
         # "convnextv2": ConvNeXtV2WithLogging,
         "resnet": ResNetWithLogging,
+        "bert": BertWithLogging,
     }
 
     args = parser.parse_args()
