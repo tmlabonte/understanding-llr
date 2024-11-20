@@ -13,7 +13,7 @@ plt.rcParams.update({"font.size": 16})
 # Define configurations
 seeds = [1,2,3]
 group_ratios = [5, 10, 20, 50, 100]  # The group ratios for LLR
-ratios = [0.05,  0.1, 0.2,0.5, 1.0]  # Ratios for ERM to plot on x-axis
+ratios = [0.05,  0.1, 0.2, 0.5, 1.0]  # Ratios for ERM to plot on x-axis
 # Colors for the different ERM group ratios
 colors = ["C0", "C1", "C2", "C3", "C4"]
 labels = {ratio: f"ERM group ratio {ratio}" for ratio in group_ratios}
@@ -40,6 +40,9 @@ with open("waterbirds_resnet_groupratio.pkl", "rb") as f:
 with open("celeba_resnet_groupratio.pkl", "rb") as f:
     celeba_results = pickle.load(f)
 
+with open("civilcomments_bert_groupratio.pkl", "rb") as f:
+    civilcomments_results = pickle.load(f)
+
 # Function to create plots for ERM and LLR across different ERM group ratios
 def plot_erm_llr(dataset_name, results, balance_methods, erm_epochs, filename):
     fig, axs = plt.subplots(1, 2, figsize=(20, 8))  # 1 row, 2 plots side by side
@@ -52,7 +55,8 @@ def plot_erm_llr(dataset_name, results, balance_methods, erm_epochs, filename):
             for j, s in enumerate(seeds):
                 try:
                     # Access the erm test_wga for the given ERM ratio
-                    erm_value = results[s][50]["subsetting"][r]["erm"].get(erm_epochs, {})
+                    #erm_value = results[s][50]["upsampling"][r]["erm"].get(erm_epochs, {})    #waterbirds/celeba
+                    erm_value = results[s]["base"]["subsetting"][r]["erm"].get(erm_epochs, {})   #civilcomments
                     if isinstance(erm_value, dict):
                         erm_values[i, j] = erm_value.get("test_wga", np.nan)
                     elif isinstance(erm_value, (float, int)):
@@ -68,7 +72,7 @@ def plot_erm_llr(dataset_name, results, balance_methods, erm_epochs, filename):
         print(erm_mean)
         plot(ax, ratios, erm_mean, f"ERM - {balance_method}", color="black", marker="^", linestyle="None")
         err(ax, ratios, erm_mean, erm_std, color="black")
-
+        """
         # For LLR lines: Iterate over ERM group ratios
         for idx, erm_group_ratio in enumerate(ratios):
             llr_values = np.zeros((len(ratios), len(seeds)))  # Rows for LLR ratios, columns for seeds
@@ -78,8 +82,8 @@ def plot_erm_llr(dataset_name, results, balance_methods, erm_epochs, filename):
                 for j, s in enumerate(seeds):
                     try:
                         # Access the llr test_wga for the given ERM and LLR group ratio
-                        erm_value = results[s][50]["subsetting"][erm_group_ratio]["erm"].get(erm_epochs, {})
-                        llr_value = results[s][50]["subsetting"][erm_group_ratio]["llr"].get(balance_method, {}).get(llr_group_ratio, {}).get(erm_epochs, {})
+                        erm_value = results[s][50]["upsampling"][erm_group_ratio]["erm"].get(erm_epochs, {})
+                        llr_value = results[s][50]["upsampling"][erm_group_ratio]["llr"].get(balance_method, {}).get(llr_group_ratio, {}).get(erm_epochs, {})
 
                         print(f"LLR value for seed {s}, ERM ratio {erm_group_ratio}, LLR ratio {llr_group_ratio}: {llr_value}")  # Debug print
                         
@@ -98,12 +102,12 @@ def plot_erm_llr(dataset_name, results, balance_methods, erm_epochs, filename):
             llr_mean, llr_std = stats(llr_values)
             plot(ax, ratios, llr_mean, f"{labels[erm_group_ratio]}", color=colors[idx], marker=None)
             err(ax, ratios, llr_mean, llr_std, color=colors[idx])
-        
+        """
         # Set ticks, grid, and scale
         ax.set_xscale("log")  # Set log scale for x-axis
         ax.set_xticks(ratios)  # Log-scale ticks at the specified ratios
         ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())  # Ensure ticks are shown as plain numbers
-        ax.set_ylim(60, 100)  # Start y-axis at 60
+        ax.set_ylim(0, 100)  # Start y-axis at 60
         ax.grid(True, alpha=0.5)
 
         ax.set_xlabel("ERM Group Ratio (Log Scale)")
@@ -125,4 +129,6 @@ def plot_erm_llr(dataset_name, results, balance_methods, erm_epochs, filename):
     plt.show()
 
 # Plot for Waterbirds with upsampling
-plot_erm_llr("Celeba", celeba_results, ["upsampling"], 20, "Celeba_Upsampling")
+#plot_erm_llr("Celeba", celeba_results, ["upsampling"], 20, "Celeba_Upsampling")
+#plot_erm_llr("Waterbirds", waterbirds_results, ["upsampling"], 100, "Waterbirds_Upsampling")
+plot_erm_llr("Civilcomments", civilcomments_results, ["upsampling"], 20, "Civilcomments_Upsampling")

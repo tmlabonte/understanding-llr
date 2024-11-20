@@ -28,6 +28,7 @@ from milkshake.datamodules.dataset import Subset
 from milkshake.datamodules.retrain import Retrain
 from milkshake.datamodules.waterbirds import Waterbirds
 from milkshake.datamodules.civilcomments import CivilComments
+
 from milkshake.main import main, load_weights
 
 
@@ -35,6 +36,7 @@ GROUP_RATIOS = {
     "celeba": np.arange(0.05, 1.05, 0.05), # About 0.061 is standard
     "waterbirds": np.arange(0.05, 1.05, 0.05), # About 0.053 is standard
     "civilcomments": np.arange(0.05, 1.05, 0.05),
+    
 }
 
 
