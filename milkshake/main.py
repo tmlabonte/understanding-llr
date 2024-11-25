@@ -187,8 +187,7 @@ def main(
        not datamodule.persistent_workers:
         datamodule.persistent_workers = True
 
-    if args.num_classes == None:
-        args.num_classes = datamodule.num_classes
+    args.num_classes = datamodule.num_classes
     args.num_groups = datamodule.num_groups
 
     args.ckpt_path = None
