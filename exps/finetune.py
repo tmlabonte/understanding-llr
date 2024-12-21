@@ -46,7 +46,7 @@ def mixtures(ratios):
 CLASS_BALANCING = {
     "celeba":        base_methods + mixtures([2., 4.]),
     "civilcomments": base_methods + mixtures([3., 5.]),
-    "multinli":      ["none"],
+    "multinli":      base_methods,
     "waterbirds":    base_methods + mixtures([2.]),
 }
 
@@ -82,12 +82,81 @@ class MultiNLIRetrain(MultiNLI, Retrain):
 
     def __init__(self, args, **kwargs):
         super().__init__(args, **kwargs)
+class CelebARetrain(CelebA, Retrain):
+    """DataModule for the CelebARetrain dataset."""
+
+    def __init__(self, args, **kwargs):
+        super().__init__(args, **kwargs)
+        self.balance_erm_type = args.balance_erm_type  # Save balance_erm_type from args
+
+    def dataloader_for_retraining(self):
+        # Logic to handle class vs. group balancing
+        if self.retrain_type == "group-unbalanced retraining":
+            return self.group_unbalanced_dataloader(self.balance_retrain)
+        elif self.retrain_type == "group-balanced retraining":
+            return self.group_balanced_dataloader(self.balance_retrain)
+        else:  # For ERM training
+            if self.balance_erm_type == "class":
+                return self.group_unbalanced_dataloader(self.balance_erm)
+            elif self.balance_erm_type == "group":
+                return self.group_balanced_dataloader(self.balance_erm)
+
+class MultiNLIRetrain(MultiNLI, Retrain):
+    """DataModule for the MultiNLIRetrain dataset."""
+
+    def __init__(self, args, **kwargs):
+        super().__init__(args, **kwargs)
+        self.balance_erm_type = args.balance_erm_type  # Save balance_erm_type from args
+
+    def dataloader_for_retraining(self):
+        # Logic to handle class vs. group balancing
+        if self.retrain_type == "group-unbalanced retraining":
+            return self.group_unbalanced_dataloader(self.balance_retrain)
+        elif self.retrain_type == "group-balanced retraining":
+            return self.group_balanced_dataloader(self.balance_retrain)
+        else:  # For ERM training
+            if self.balance_erm_type == "class":
+                return self.group_unbalanced_dataloader(self.balance_erm)
+            elif self.balance_erm_type == "group":
+                return self.group_balanced_dataloader(self.balance_erm)
+
+class CivilCommentsRetrain(CivilComments, Retrain):
+    """DataModule for the CivilCommentsRetrain dataset."""
+
+    def __init__(self, args, **kwargs):
+        super().__init__(args, **kwargs)
+        self.balance_erm_type = args.balance_erm_type  # Save balance_erm_type from args
+
+    def dataloader_for_retraining(self):
+        # Logic to handle class vs. group balancing
+        if self.retrain_type == "group-unbalanced retraining":
+            return self.group_unbalanced_dataloader(self.balance_retrain)
+        elif self.retrain_type == "group-balanced retraining":
+            return self.group_balanced_dataloader(self.balance_retrain)
+        else:  # For ERM training
+            if self.balance_erm_type == "class":
+                return self.group_unbalanced_dataloader(self.balance_erm)
+            elif self.balance_erm_type == "group":
+                return self.group_balanced_dataloader(self.balance_erm)
 
 class WaterbirdsRetrain(Waterbirds, Retrain):
     """DataModule for the WaterbirdsRetrain dataset."""
 
     def __init__(self, args, **kwargs):
         super().__init__(args, **kwargs)
+        self.balance_erm_type = args.balance_erm_type  # Save balance_erm_type from args
+
+    def dataloader_for_retraining(self):
+        # Example logic to handle class vs. group balancing
+        if self.retrain_type == "group-unbalanced retraining":
+            return self.group_unbalanced_dataloader(self.balance_retrain)
+        elif self.retrain_type == "group-balanced retraining":
+            return self.group_balanced_dataloader(self.balance_retrain)
+        else:  # For ERM training
+            if self.balance_erm_type == "class":
+                return self.group_unbalanced_dataloader(self.balance_erm)
+            elif self.balance_erm_type == "group":
+                return self.group_balanced_dataloader(self.balance_erm)
 
 def log_results_helper(
     args,
@@ -293,20 +362,38 @@ def experiment(args, model_class, datamodule_class):
 
     # Sets class weights for loss-based class-balancing.
     # MultiNLI is class-balanced a priori, so we do not include it here.
-    if args.balance_erm == "upweighting":
-        if args.datamodule == "celeba":
-            args.class_weights = [1, 5.71]
-        elif args.datamodule == "civilcomments":
-            args.class_weights = [1, 7.85]
-        elif args.datamodule == "waterbirds":
-            args.class_weights = [1, 3.31]
 
+    if args.balance_erm == "upweighting":
+        if args.balance_erm_type == "class":
+            # Class-based weights
+            if args.datamodule == "celeba":
+                args.class_weights = [1, 5.71]
+            elif args.datamodule == "civilcomments":
+                args.class_weights = [1, 7.85]
+            elif args.datamodule == "waterbirds":
+                args.class_weights = [1, 3.31]
+        elif args.balance_erm_type == "group":
+            # Group-based weights (hypothetical example, adjust based on dataset needs)
+            if args.datamodule == "celeba":
+                args.group_weights = [0.4, 0.6]  
+            elif args.datamodule == "civilcomments":
+                args.group_weights = [0.3, 0.7]
+            elif args.datamodule == "waterbirds":
+                args.group_weights = [0.5, 0.5]
     # Creates results dict if it does not exist.
     if not osp.isfile(args.results_pkl):
         load_results(args)
 
     main(args, model_class, datamodule_class)
-    
+
+def weighted_loss(logits, targets, group_labels, group_weights=None, balance_erm_type="class"):
+    loss = F.cross_entropy(logits, targets, reduction="none")
+    if balance_erm_type == "group" and group_weights is not None:
+        sample_weights = group_weights[group_labels]
+        loss = loss * sample_weights
+    return loss.mean()
+
+
 if __name__ == "__main__":
     parser = Parser(
         args_for_setting_config_path=["-c", "--cfg", "--config"],
@@ -317,6 +404,9 @@ if __name__ == "__main__":
     parser = Trainer.add_argparse_args(parser)
 
     # Arguments imported from retrain.py.
+    # Extend the argument parser to include balance_erm_type
+    parser.add("--balance_erm_type", choices=["class", "group"], default="class",
+            help="Specify whether class or group balancing is used during ERM training.")
     parser.add("--balance_erm", choices=["mixture", "none", "subsetting", "upsampling", "upweighting"], default="none",
                help="Which type of class-balancing to perform during ERM training.")
     parser.add("--balance_retrain", choices=["mixture", "none", "subsetting", "upsampling", "upweighting"], default="none",
@@ -332,12 +422,14 @@ if __name__ == "__main__":
     parser.add("--train_pct", default=100, type=int,
                help="The percentage of the train set to utilize (for ablations)")
 
+
     datamodules = {
         "celeba": CelebARetrain,
         "civilcomments": CivilCommentsRetrain,
         "multinli": MultiNLIRetrain,
         "waterbirds": WaterbirdsRetrain,
     }
+
     models = {
         "bert": BERTWithLogging,
         "convnextv2": ConvNeXtV2WithLogging,

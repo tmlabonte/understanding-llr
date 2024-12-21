@@ -270,8 +270,11 @@ class Retrain(DataModule):
             return self.group_unbalanced_dataloader(self.balance_retrain)
         elif self.retrain_type == "group-balanced retraining":
             return self.group_balanced_dataloader(self.balance_retrain)
-        else: # For ERM training.
-            return self.group_unbalanced_dataloader(self.balance_erm)
+        else:  # For ERM training.
+            if self.balance_erm_type == "class":
+                return self.group_unbalanced_dataloader(self.balance_erm)
+            elif self.balance_erm_type == "group":
+                return self.group_balanced_dataloader(self.balance_erm)
 
     def val_dataloader(self):
         """Returns validation DataLoaders including train/test set.
