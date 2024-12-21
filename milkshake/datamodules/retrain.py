@@ -248,6 +248,8 @@ class Retrain(DataModule):
                 self.dataset_train, class_or_group="group")
             self.balanced_sampler = True
             return super().train_dataloader()
+        elif balance == "upweighting":
+            return super().train_dataloader()
         else:
             raise ValueError("Must set balance for group-balanced training.")
 
