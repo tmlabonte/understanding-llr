@@ -115,7 +115,7 @@ def find_erm_weights(args):
 
 
 def experiment(args, model_class, datamodule_class):
-    """Runs main training and evaluation procedure."""
+    """Trains last layer using existing features and normalized SGD"""
 
     args.no_test = True
     find_erm_weights(args)
