@@ -1,0 +1,15 @@
+accelerator: gpu
+batch_size: 32
+check_val_every_n_epochs: 10
+ckpt_every_n_epochs: 10
+num_sanity_val_steps: 0
+datamodule: waterbirds
+devices: 1
+lr: 3e-3
+lr_scheduler: cosine
+max_epochs: 100
+metrics: [loss, acc, acc_by_class, acc_by_group, global_cov, inter_class_cov, intra_class_cov, inter_group_cov, intra_group_cov, class_trace, group_trace, max_margin, min_margin, avg_margin, weight_norm, min_margin_by_group, max_margin_by_group, avg_margin_by_group]
+model: resnet
+resnet_version: 18
+optimizer: adamw
+wandb: True

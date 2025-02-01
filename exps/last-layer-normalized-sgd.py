@@ -15,7 +15,7 @@ from configargparse import Parser
 import numpy as np
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 from pytorch_lightning import Trainer
 from torchvision import models, transforms
 from sklearn.svm import LinearSVC
@@ -69,6 +69,43 @@ class ResNetWithFeatures(ResNet):
                 self.features = output.detach()
             return hook
         handle = self.model.avgpool.register_forward_hook(get_features())
+
+
+class NormalizedSGD(torch.optim.Optimizer):
+    def __init__(self, params, lr):
+        """
+        Normalized Stochastic Gradient Descent optimizer.
+
+        Args:
+            params (iterable): Parameters to optimize.
+            lr (float): Learning rate.
+        """
+        if lr <= 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        defaults = dict(lr=lr)
+        super(NormalizedSGD, self).__init__(params, defaults)
+
+    def step(self, closure=None):
+        """
+        Perform a single optimization step.
+        """
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                # Normalize the gradient
+                grad_norm = torch.norm(grad)
+                if grad_norm > 0:
+                    grad = grad / grad_norm
+                # Update parameters
+                p.data.add_(grad, alpha=-group['lr'])
+
+        return loss
 
 def find_erm_weights(args):
     """Retrieves ERM weights from pickle file based on model config."""
@@ -132,91 +169,71 @@ def experiment(args, model_class, datamodule_class):
 
     nn_model = load_weights(args, nn_model)
 
-    # Extract the last fully connected layer weights for later comparison
+    print(nn_model)
 
-    if args.model == "convnextv2":
-        original_fc_weights = nn_model.model.classifier.weight.data.clone()
-        original_fc_bias = nn_model.model.classifier.bias.data.clone()
-    elif args.model == "resnet":
-        original_fc_weights = nn_model.model.fc[1].weight.data.clone()
-        original_fc_bias = nn_model.model.fc[1].bias.data.clone()
-    else:
-        original_fc_weights = nn_model.model.fc.weight.data.clone()
-        original_fc_bias = nn_model.model.fc.bias.data.clone()
+    # # Extract the last fully connected layer weights for later comparison
 
-    print(original_fc_weights.shape)
+    # if args.model == "convnextv2":
+    #     original_fc_weights = nn_model.model.classifier.weight.data.clone()
+    #     original_fc_bias = nn_model.model.classifier.bias.data.clone()
+    # elif args.model == "resnet":
+    #     original_fc_weights = nn_model.model.fc[1].weight.data.clone()
+    #     original_fc_bias = nn_model.model.fc[1].bias.data.clone()
+    # else:
+    #     original_fc_weights = nn_model.model.fc.weight.data.clone()
+    #     original_fc_bias = nn_model.model.fc.bias.data.clone()
 
-    print("Extracting Features")
+    # print(original_fc_weights.shape)
 
-    features = []
-    labels = []
-    nn_normalized_min_margin = None
+    # print("Extracting Features")
 
-    with torch.no_grad():
-        for batch in datamodule.train_dataloader():
-            data, target = batch
-            output = nn_model(data)
+    # features = []
+    # labels = []
 
-            # correct_class_logits = output[target[:, 0]]
-            # incorrect_class_logits = output[1 - target[:, 0]]
+    # with torch.no_grad():
+    #     for batch in datamodule.train_dataloader():
+    #         data, target = batch
+    #         output = nn_model(data)
 
-            # correct_class_weights = original_fc_weights[target[:, 0]]  # Shape: [batch_size, 512]
-            # weight_norms = torch.norm(correct_class_weights, p=2, dim=1)
+    #         features.append(nn_model.features)
+    #         labels.append(target)  
 
-            # margins = correct_class_logits - incorrect_class_logits
-            # normalized_margins = margins / weight_norms
-            # if nn_normalized_min_margin == None or (len(normalized_margins[normalized_margins > 0]) > 0 and torch.min(normalized_margins[normalized_margins > 0]) < nn_normalized_min_margin):
-            #     nn_normalized_min_margin = torch.min(normalized_margins[normalized_margins > 0])
+    # labels = torch.cat(labels, axis=0)
+    # features = torch.cat(features, axis=0).squeeze()
 
-            features.append(nn_model.features)
-            labels.append(target)  
+    # print(features.shape)
+    # print(labels.shape)
+    
+    # print("Create Feature Dataset")
 
-    labels = torch.cat(labels, axis=0)
-    features = torch.cat(features, axis=0).squeeze()
-
-    print(features.shape)
-    print(labels.shape)
-    # print(nn_normalized_min_margin)
+    # dataset = TensorDataset(features, labels)
+    # dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
       
-    # Train your SVM
+    # # Train your SVM
 
-    print("Fitting SVM")
+    # print("Fitting SVM")
 
-    svm = LinearSVC(fit_intercept=False, C=1e5)
-    svm.fit(features, labels[:, 0])
+    # svm = LinearSVC(fit_intercept=False, C=1e5)
+    # svm.fit(features, labels[:, 0])
 
-    # # Get the support vectors
-    # support_vectors = svm.support_vectors_
+    # svm_weights = svm.coef_
 
-    # # Calculate the distance from the support vectors to the hyperplane
-    # distances = svm.decision_function(support_vectors)
+    # # Normalize SVM weights
+    # svm_weights_normalized = svm_weights / np.linalg.norm(svm_weights)
 
-    # # Find the minimum distance
-    # svm_min_margin = min(abs(distances))
+    # # # Original FC layer weights
+    # # original_fc_weights_normalized = original_fc_weights / np.linalg.norm(original_fc_weights)
 
-    # Compare SVM weights with the original model's FC layer weights
-    svm_weights = svm.coef_
 
-    # # Normalize the min margin by the norm of the weights
-    # svm_normalized_min_margin = svm_min_margin /  np.linalg.norm(svm_weights)
 
-    # # This line doubles the SVM weights to have weights for both classes
-    # svm_weights = np.vstack([svm_weights, -svm_weights])
 
-    # Normalize SVM weights
-    svm_weights_normalized = svm_weights / np.linalg.norm(svm_weights)
 
-    # Original FC layer weights
-    original_fc_weights_normalized = original_fc_weights / np.linalg.norm(original_fc_weights)
 
-    # Similarity Metrics
-    cosine_similarity = np.dot(svm_weights_normalized.flatten(), original_fc_weights_normalized.flatten())
-    directional_error = np.linalg.norm(original_fc_weights_normalized - svm_weights_normalized)
-    print(f'Cosine Similarity between SVM and original FC weights: {cosine_similarity:.4f}')
-    print(f'Directional Error between SVM and original FC weights: {directional_error:.4f}')
-
-    # print(f'SVM Margin: {svm_normalized_min_margin:.4f}')
-    # print(f'NN Last Layer Margin: {nn_normalized_min_margin:.4f}')
+    # # Similarity Metrics
+    # cosine_similarity = np.dot(svm_weights_normalized.flatten(), original_fc_weights_normalized.flatten())
+    # directional_error = np.linalg.norm(original_fc_weights_normalized - svm_weights_normalized)
+    # print(f'Cosine Similarity between SVM and original FC weights: {cosine_similarity:.4f}')
+    # print(f'Directional Error between SVM and original FC weights: {directional_error:.4f}')
 
 
 if __name__ == "__main__":
@@ -260,7 +277,7 @@ if __name__ == "__main__":
     args.train_type = "erm"
 
     if args.layerwise == True:
-        args.results_pkl = f"{args.datamodule}_{args.model}_layerwise_100_epochs.pkl"
+        args.results_pkl = f"{args.datamodule}_{args.model}_layerwise.pkl"
     else:
         args.results_pkl = f"{args.datamodule}_{args.model}.pkl"
     print(args.results_pkl)

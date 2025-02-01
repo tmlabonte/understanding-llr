@@ -7,14 +7,17 @@ ignore_warnings()
 # Imports Python builtins.
 import os.path as osp
 import pickle
+from copy import deepcopy
 
 # Imports Python packages.
 from configargparse import Parser
 import numpy as np
+from distutils.util import strtobool
 
 # Imports PyTorch packages.
 import torch
 from pytorch_lightning import Trainer
+import torch.nn.functional as F
 
 # Imports milkshake packages.
 from milkshake.args import add_input_args
@@ -23,18 +26,23 @@ from milkshake.datamodules.civilcomments import CivilComments
 from milkshake.datamodules.multinli import MultiNLI
 from milkshake.datamodules.retrain import Retrain
 from milkshake.datamodules.waterbirds import Waterbirds
-from milkshake.main import main
+from milkshake.main import main, load_weights
 from milkshake.models.bert import BERT
 from milkshake.models.convnextv2 import ConvNeXtV2
 from milkshake.models.resnet import ResNet
-from milkshake.utils import to_np
+from milkshake.imports import valid_models_and_datamodules
+from milkshake.main import main
+from milkshake.utils import compute_accuracy, get_weights, to_np
+from milkshake.utils import compute_accuracy
 
 
 METRICS = ["test_aa", "test_acc_by_class", "test_acc_by_group",
             "test_wca", "test_wga", "train_aa", "train_acc_by_class",
             "train_acc_by_group", "train_wca", "train_wga", "version",
             "global_cov", "inter_class_cov", "intra_class_cov", 
-            "inter_group_cov", "intra_group_cov", "class_trace", "group_trace"]
+            "inter_group_cov", "intra_group_cov", "class_trace", "group_trace",
+            "max_margin", "min_margin", "avg_margin", "weight_norm", "min_margin_by_group",
+            "max_margin_by_group", "avg_margin_by_group"]
 SEEDS = [1, 2, 3]
 TRAIN_TYPES = ["erm", "llr", "dfr"]
 
@@ -89,6 +97,15 @@ class WaterbirdsRetrain(Waterbirds, Retrain):
         super().__init__(args, **kwargs)
 
 
+def get_unfrozen_params(model):
+    return filter(lambda p: p.requires_grad, model.parameters())
+
+def compute_norm_of_unfrozen_weights(model):
+    unfrozen_params = get_unfrozen_params(model)
+    total_norm = torch.norm(torch.cat([p.view(-1) for p in unfrozen_params]), 2)
+    return total_norm.item()
+
+
 def get_vectorized_features(targets, features, num_classes, num_groups):
     """Gets vectorized features for each group, class, and training split.
 
@@ -139,7 +156,7 @@ def get_vectorized_features(targets, features, num_classes, num_groups):
 
     return vectorized_features
 
-class FeatureCollapseResNet(ResNet):
+class FeatureCollapseMarginResNet(ResNet):
     def __init__(self, args):
         super().__init__(args)
         self.features = None
@@ -281,7 +298,10 @@ class FeatureCollapseResNet(ResNet):
             inter_class_cov = torch.nan_to_num(inter_class_cov, nan=0.0)
 
             # The problematic line
-            class_trace = (intra_class_cov * torch.linalg.pinv(inter_class_cov, hermitian=True).t()).sum() / self.hparams.num_classes
+            # class_trace = (intra_class_cov * torch.linalg.pinv(inter_class_cov, hermitian=True).t()).sum() / self.hparams.num_classes
+            epsilon = 1e-6  # Adjust as needed
+            inter_class_cov_reg = inter_class_cov + torch.eye(inter_class_cov.shape[0], device=inter_class_cov.device) * epsilon
+            class_trace = (intra_class_cov * torch.linalg.pinv(inter_class_cov_reg, hermitian=True).t()).sum() / self.hparams.num_classes
             
             return inter_class_cov_norm, intra_class_cov_norm, class_trace
         elif mode == "group":
@@ -306,7 +326,13 @@ class FeatureCollapseResNet(ResNet):
             inter_group_cov = torch.nan_to_num(inter_group_cov, nan=0.0)
 
             # The problematic line
-            group_trace = (intra_group_cov * torch.linalg.pinv(inter_group_cov, hermitian=True).t()).sum() / self.hparams.num_classes
+            # group_trace = (intra_group_cov * torch.linalg.pinv(inter_group_cov, hermitian=True).t()).sum() / self.hparams.num_groups
+            epsilon = 1e-6  # Adjust as needed
+            inter_group_cov_reg = inter_group_cov + torch.eye(inter_group_cov.shape[0], device=inter_group_cov.device) * epsilon
+            group_trace = (intra_group_cov * torch.linalg.pinv(inter_group_cov_reg, hermitian=True).t()).sum() / self.hparams.num_groups
+
+
+
             return inter_group_cov_norm, intra_group_cov_norm, group_trace
 
     def compute_collapse_metrics(self):
@@ -346,6 +372,142 @@ class FeatureCollapseResNet(ResNet):
         }
 
         return collapse_metrics
+    
+    torch.no_grad()
+    def log_margin_metrics(self, dataloader_idx):
+        """Performs margin metrics computation.
+
+        Returns:
+            margin_metrics: The dictionary of margins and weight norms.
+        """
+        
+        self.eval()
+
+        # Compute the L2 norm of the network weights 
+        weight_norm = compute_norm_of_unfrozen_weights(self)
+
+        # Initialize lists to store correct class scores and maximum incorrect class scores
+        correct_class_scores_list = []
+        max_incorrect_class_scores_list = []
+        group_labels = []
+
+        with torch.no_grad():
+            for idx, batch in enumerate(self.trainer.train_dataloader):
+                data = batch[0].cuda()
+                labels = batch[1].cuda()
+
+                group_labels_batch = labels[:, 1].tolist()
+                group_labels.extend(group_labels_batch)
+
+                # Forward pass
+                output_scores = self(data)
+
+                # Computes loss and prediction probabilities.
+                if self.hparams.num_classes == 1:
+                    output_scores = torch.sigmoid(output_scores)
+                else:
+                    output_scores = F.softmax(output_scores, dim=1)                
+
+                # Iterate through examples in the batch
+                for i in range(len(labels)):
+                    class_label = labels[i, 0]
+
+                    # Extract scores for the correct class
+                    correct_class_score = output_scores[i, class_label]
+
+                    # Extract scores for all other classes
+                    incorrect_class_scores = output_scores[i][labels[i, 0] != torch.arange(output_scores.size(1)).cuda()]
+
+                    # Calculate the maximum incorrect class score
+                    max_incorrect_class_score = torch.max(incorrect_class_scores)
+
+                    # Store correct and incorrect class scores
+                    correct_class_scores_list.append(correct_class_score.item())
+                    max_incorrect_class_scores_list.append(max_incorrect_class_score.item())
+
+        # Convert lists to tensors
+        correct_class_scores_tensor = torch.tensor(correct_class_scores_list)
+        max_incorrect_class_scores_tensor = torch.tensor(max_incorrect_class_scores_list)
+        group_labels = torch.tensor(group_labels)
+
+        # Get unique group labels
+        unique_groups = torch.unique(group_labels)
+
+        # Calculate margins for each point
+        margins = correct_class_scores_tensor - max_incorrect_class_scores_tensor
+        normalized_margins = margins / weight_norm
+
+        # Create a mask for the positive margins
+        positive_margin_mask = normalized_margins > 0
+        positive_margins = normalized_margins[positive_margin_mask]
+
+        # Calculates max, min, average, and per group margins.
+        if positive_margins.numel() > 0:
+            min_margin = torch.min(positive_margins)
+        else:
+            min_margin = 0
+        max_margin = torch.max(normalized_margins)
+        avg_margin = torch.sum(normalized_margins) / len(normalized_margins)
+
+        margin_metrics = {
+            "max_margin": max_margin,
+            "min_margin": min_margin,
+            "avg_margin": avg_margin,
+            "weight_norm": weight_norm
+        }
+
+        self.log_metrics(margin_metrics, "train", dataloader_idx)
+
+        if "min_margin_by_group" in self.hparams.metrics or\
+            "max_margin_by_group" in self.hparams.metrics or\
+            "avg_margin_by_group" in self.hparams.metrics:
+
+            names = []
+            values = []
+
+            min_margins_by_group = []
+            max_margins_by_group = []
+            avg_margins_by_group = []
+
+            # Iterate over unique group labels
+            for group_label in unique_groups:
+                # Mask to filter margins for the current group
+                mask = (group_labels == group_label)
+                
+                # Filter margins for the current group
+                normalized_margins_for_group = normalized_margins[mask]
+
+                # Create a mask for the positive margins
+                positive_group_margin_mask = normalized_margins_for_group > 0
+                positive_group_margins = normalized_margins_for_group[positive_group_margin_mask]
+                
+                # Calculate the margins for the current group
+                if positive_group_margins.numel() > 0:
+                    min_margin_for_group = torch.min(positive_group_margins)
+                else:
+                    min_margin_for_group = torch.tensor(0)
+
+                max_margin_for_group = torch.max(normalized_margins_for_group)
+                avg_margin_for_group = torch.sum(normalized_margins_for_group) / len(normalized_margins_for_group)
+
+                
+                # Append the result to the list
+                min_margins_by_group.append(min_margin_for_group.item())
+                max_margins_by_group.append(max_margin_for_group.item())
+                avg_margins_by_group.append(avg_margin_for_group.item())
+
+            if "min_margin_by_group" in self.hparams.metrics:
+                names.extend([f"min_margin_group{group}" for group in unique_groups])
+                values.extend(list(min_margins_by_group))
+            if "max_margin_by_group" in self.hparams.metrics:
+                names.extend([f"max_margin_group{group}" for group in unique_groups])
+                values.extend(list(max_margins_by_group))
+            if "avg_margin_by_group" in self.hparams.metrics:
+                names.extend([f"avg_margin_group{group}" for group in unique_groups])
+                values.extend(list(avg_margins_by_group))
+
+            self.log_helper2(names, values, dataloader_idx)
+
 
     def training_epoch_end(self, training_step_outputs):
         """Collates metrics upon completion of the training epoch.
@@ -359,6 +521,8 @@ class FeatureCollapseResNet(ResNet):
         collapse_metrics = self.compute_collapse_metrics()
 
         dataloader_idx = training_step_outputs[0]["dataloader_idx"]
+
+        self.log_margin_metrics(dataloader_idx)
 
         self.collate_metrics(training_step_outputs, "train")
 
@@ -378,9 +542,7 @@ class FeatureCollapseResNet(ResNet):
 
         dump_results(args, self.current_epoch + 1, collapse_metrics)
 
-
-
-def log_results(
+def log_results_helper(
     args,
     epoch,
     version,
@@ -429,6 +591,29 @@ def log_results(
         results[prefix + "acc_by_class"] = list(to_np(acc_by_class))  # Optionally add class accuracies to results
 
     results["version"] = version
+
+    return results
+
+def log_results(
+    args,
+    epoch,
+    version,
+    validation_step_outputs,
+    weight_aa_by_proportion=False,
+):
+    """Exports validation accuracies to dict and dumps to disk.
+
+    This setup makes it easy to overwrite dump_results in another exp
+    if one wants to add a new key to the results dict.
+    """
+
+    results = log_results_helper(
+        args,
+        epoch,
+        version,
+        validation_step_outputs,
+        weight_aa_by_proportion=weight_aa_by_proportion,
+    )
     dump_results(args, epoch, results)
 
 class BERTWithLogging(BERT):
@@ -586,10 +771,10 @@ if __name__ == "__main__":
     models = {
         "bert": BERTWithLogging,
         "convnextv2": ConvNeXtV2WithLogging,
-        "resnet": FeatureCollapseResNet,
+        "resnet": FeatureCollapseMarginResNet,
     }
 
     args = parser.parse_args()
     args.train_type = "erm"
-    args.results_pkl = f"{args.datamodule}_{args.model}_collapse.pkl"
+    args.results_pkl = f"{args.datamodule}_{args.model}_collapse_margin.pkl"
     experiment(args, models[args.model], datamodules[args.datamodule])
