@@ -159,6 +159,8 @@ if __name__ == "__main__":
     parser = Trainer.add_argparse_args(parser)
 
     # Arguments imported from retrain.py.
+    parser.add("--balance_erm_type", choices=["class", "group"], default="class",
+            help="Specify whether class or group balancing is used during ERM training.")
     parser.add("--balance_erm", choices=["mixture", "none", "subsetting", "upsampling", "upweighting"], default="none",
                help="Which type of class-balancing to perform during ERM training.")
     parser.add("--balance_retrain", choices=["mixture", "none", "subsetting", "upsampling", "upweighting"], default="none",
@@ -174,7 +176,7 @@ if __name__ == "__main__":
     parser.add("--train_pct", default=100, type=int,
                help="The percentage of the train set to utilize (for ablations)")
 
-    parser.add("--retrain_type", choices=["llr", "dfr", "both"], default="llr",
+    parser.add("--retrain_type", choices=["llr", "dfr", "both"], default="both",
                help="Whether to perform LLR, DFR, or both.")
 
     datamodules = {

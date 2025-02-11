@@ -48,6 +48,7 @@ class GroupRatio(Retrain):
         self.erm_group_ratio = args.erm_group_ratio
         self.retrain_group_ratio = args.retrain_group_ratio
         self.orig_datamodule = args.datamodule
+        self.balance_erm_type = args.balance_erm_type 
 
     def make_group_ratio_sampler(self, dataset, group_ratio):
         """Returns a WeightedRandomSampler with the specified group ratio.
@@ -65,7 +66,7 @@ class GroupRatio(Retrain):
 
         minority_pct = group_ratio / (group_ratio + 1)
         if self.orig_datamodule == "celeba":
-            # Ex. group_ratio 50 => group weights [0.25, 0.25, 0.333, 0.167]
+            # Ex. group_ratio 0.5 => group weights [0.25, 0.25, 0.333, 0.167]
             weights_by_group = [
                 0.5,
                 0.5,
@@ -74,7 +75,7 @@ class GroupRatio(Retrain):
             ]
             print(weights_by_group)
         elif self.orig_datamodule == "waterbirds":
-            # Ex. group_ratio 50 => group weights [0.333, 0.167, 0.167, 0.333]
+            # Ex. group_ratio 0.5 => group weights [0.333, 0.167, 0.167, 0.333]
             weights_by_group = [
                 1 - minority_pct,
                 minority_pct,
@@ -92,17 +93,17 @@ class GroupRatio(Retrain):
             ]
             print(weights_by_group)
         elif self.orig_datamodule == "multinli":
-            # Ex. group_ratio 50 => group weights [0.333, 0.111, 0.333, 0.111, 0.333, 0.111]
+            # Ex. group_ratio 0.5 => group weights [0.222, 0.111, 0.222, 0.111, 0.222, 0.111]
             #minority_pct = group_ratio / (group_ratio + 1)
             weights_by_group = [
-                1 - minority_pct,  # Group 0
-                minority_pct,      # Group 1 (minority)
-                1 - minority_pct,  # Group 2
-                minority_pct,      # Group 3 (minority)
-                1 - minority_pct,  # Group 4
-                minority_pct,      # Group 5 (minority)
+                (1 - minority_pct) / 3,  # Group 0
+                minority_pct /3,      # Group 1 (minority)
+                (1 - minority_pct) / 3,  # Group 2
+                minority_pct /3,      # Group 3 (minority)
+                (1 - minority_pct) / 3,  # Group 4
+                minority_pct /3,      # Group 5 (minority)
             ]
-            print(weights_by_group)
+        print(weights_by_group)
 
         weights = [0] * len(groups)
         for j, group in enumerate(groups):
@@ -214,25 +215,26 @@ class WaterbirdsGroupRatio(Waterbirds, GroupRatio):
 
     def __init__(self, args, **kwargs):
         super().__init__(args, **kwargs)
+        self.balance_erm_type = args.balance_erm_type 
 
 class CelebAGroupRatio(CelebA, GroupRatio):
     """DataModule for the CelebAGroupRatio dataset."""
 
     def __init__(self, args, **kwargs):
         super().__init__(args, **kwargs)
-
+        
 class CivilCommentsGroupRatio(CivilComments, GroupRatio):
     """DataModule for the CivilCommentsGroupRatio dataset."""
 
     def __init__(self, args, **kwargs):
         super().__init__(args, **kwargs)
-
+        
 class MultiNLIGroupRatio(MultiNLI, GroupRatio):
     """DataModule for the MultiNLIGroupRatio dataset."""
 
     def __init__(self, args, **kwargs):
         super().__init__(args, **kwargs)
-
+        
 
 def load_results(args):
     """Loads results file or creates it if it does not exist."""
@@ -440,6 +442,9 @@ if __name__ == "__main__":
 
     parser = add_input_args(parser)
     parser = Trainer.add_argparse_args(parser)
+
+    parser.add("--balance_erm_type", choices=["class", "group"], default="class",
+            help="Specify whether class or group balancing is used during ERM training.")
 
     # Arguments imported from retrain.py.
     parser.add("--balance_erm", choices=["mixture", "none", "subsetting", "upsampling", "upweighting"], default="none",

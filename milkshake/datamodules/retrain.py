@@ -322,3 +322,27 @@ class Retrain(DataModule):
         self._initialize_datasets_no_aug(dataset_val)
         
         print(self.load_msg())
+
+    def _make_balanced_subset_helper(
+        self,
+        indices,
+        targets_or_groups,
+        min_count,
+        len_targets_or_groups,
+    ):
+        """Makes a subset of indices which is balanced across classes/groups."""
+        
+        subset = []
+        counts = [0] * len_targets_or_groups
+        for idx, target_or_group in zip(indices, targets_or_groups):
+            if counts[target_or_group] < min_count:
+                subset.append(idx)
+                counts[target_or_group] += 1
+        
+        # Print detailed selection information
+        seed_info = f" (Seed: {self.seed})" if hasattr(self, "seed") else ""
+        print(f"Balanced subset selection{seed_info}:")
+        for group_idx, count in enumerate(counts):
+            print(f"  - Group {group_idx}: {count} samples selected")
+
+        return subset

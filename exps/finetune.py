@@ -176,7 +176,7 @@ def step_with_upweighting(args, logits, targets):
         # Performs class/group weighting.
         loss = F.cross_entropy(logits, targets[:, 0], reduction="none")
         if args.balance_erm_type == "class" and args.class_weights:
-            weights = torch.tensor(args.group_weights, device=targets.device)
+            weights = torch.tensor(args.class_weights, device=targets.device)
             multiplier = weights[targets[:, 0]]
             loss *= multiplier
         elif args.balance_erm_type == "group" and args.group_weights:

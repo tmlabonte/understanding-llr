@@ -3,7 +3,7 @@ import os.path as osp
 import pickle
 import matplotlib.pyplot as plt
 import numpy as np
-
+from scipy.stats import pearsonr
 # Ignores nuisance warnings. Must be called first.
 from milkshake.utils import ignore_warnings
 ignore_warnings()
@@ -43,92 +43,115 @@ with open("celeba_resnet_groupratio.pkl", "rb") as f:
 with open("civilcomments_bert_groupratio.pkl", "rb") as f:
     civilcomments_results = pickle.load(f)
 
-# Function to create plots for ERM and LLR across different ERM group ratios
-def plot_erm_llr(dataset_name, results, balance_methods, erm_epochs, filename):
-    fig, axs = plt.subplots(1, 2, figsize=(20, 8))  # 1 row, 2 plots side by side
+with open("multinli_bert_groupratio.pkl", "rb") as f:
+    multinli_results = pickle.load(f)
 
 
-    def plot_data(ax, balance_method):
-        # For ERM triangles: Fixed points for each ERM group ratio
-        erm_values = np.zeros((len(ratios), len(seeds)))  # Rows for ERM ratios, columns for seeds
-        for i, r in enumerate(ratios):
-            for j, s in enumerate(seeds):
-                try:
-                    # Access the erm test_wga for the given ERM ratio
-                    #erm_value = results[s][50]["upsampling"][r]["erm"].get(erm_epochs, {})    #waterbirds/celeba
-                    erm_value = results[s]["base"]["subsetting"][r]["erm"].get(erm_epochs, {})   #civilcomments
-                    if isinstance(erm_value, dict):
-                        erm_values[i, j] = erm_value.get("test_wga", np.nan)
-                    elif isinstance(erm_value, (float, int)):
-                        erm_values[i, j] = erm_value
-                    else:
-                        erm_values[i, j] = np.nan
-                except KeyError as e:
-                    print(f"KeyError: {e}")
-                    erm_values[i, j] = np.nan
 
-        # Plot triangles for ERM
-        erm_mean, erm_std = stats(erm_values)
-        print(erm_mean)
-        plot(ax, ratios, erm_mean, f"ERM - {balance_method}", color="black", marker="^", linestyle="None")
-        err(ax, ratios, erm_mean, erm_std, color="black")
-        """
-        # For LLR lines: Iterate over ERM group ratios
-        for idx, erm_group_ratio in enumerate(ratios):
-            llr_values = np.zeros((len(ratios), len(seeds)))  # Rows for LLR ratios, columns for seeds
-            
-            # For each LLR ratio, calculate the corresponding LLR values
-            for i, llr_group_ratio in enumerate(ratios):
+def plot_all_datasets_with_correlation(results_dict, balance_method, filename):
+    """
+    Combines plots for Waterbirds, CelebA, Civilcomments, and MultiNLI datasets in a single figure.
+    Computes and displays correlation coefficients between ERM and LLR lines.
+    
+    Args:
+        results_dict: A dictionary with dataset names as keys and results as values.
+        balance_method: The balance method to use (e.g., "upsampling").
+        filename: The filename for saving the output plot.
+    """
+    fig, axs = plt.subplots(2, 2, figsize=(20, 16))  # 2 rows, 2 columns for 4 datasets
+    dataset_names = list(results_dict.keys())
+    axes = axs.flatten()
+
+    for i, dataset_name in enumerate(dataset_names):
+        results = results_dict[dataset_name]
+        # Set specific epochs based on the dataset
+        erm_epochs = 100 if dataset_name == "Waterbirds" else 20
+
+        # Plotting function
+        def plot_data(ax):
+            # For ERM triangles: Fixed points for each ERM group ratio
+            erm_values = np.zeros((len(ratios), len(seeds)))  # Rows for ERM ratios, columns for seeds
+            for i, r in enumerate(ratios):
                 for j, s in enumerate(seeds):
                     try:
-                        # Access the llr test_wga for the given ERM and LLR group ratio
-                        erm_value = results[s][50]["upsampling"][erm_group_ratio]["erm"].get(erm_epochs, {})
-                        llr_value = results[s][50]["upsampling"][erm_group_ratio]["llr"].get(balance_method, {}).get(llr_group_ratio, {}).get(erm_epochs, {})
-
-                        print(f"LLR value for seed {s}, ERM ratio {erm_group_ratio}, LLR ratio {llr_group_ratio}: {llr_value}")  # Debug print
-                        
-                        # Check if llr_value is a dictionary or a float
-                        if isinstance(llr_value, dict):
-                            llr_values[i, j] = llr_value.get("test_wga", np.nan)  # Extract 'test_wga' if it's a dictionary
-                        elif isinstance(llr_value, (float, int)):  # In case it's directly a number
-                            llr_values[i, j] = llr_value
+                        erm_value = results[s]["base" if dataset_name in ["Civilcomments", "MultiNLI"] else 50]["upsampling" if dataset_name == "Waterbirds" else "subsetting"][r]["erm"].get(erm_epochs, {})
+                        if isinstance(erm_value, dict):
+                            erm_values[i, j] = erm_value.get("test_wga", np.nan)
+                        elif isinstance(erm_value, (float, int)):
+                            erm_values[i, j] = erm_value
                         else:
-                            llr_values[i, j] = np.nan
+                            erm_values[i, j] = np.nan
                     except KeyError as e:
                         print(f"KeyError: {e}")
-                        llr_values[i, j] = np.nan
+                        erm_values[i, j] = np.nan
 
-            # Plot each line for ERM group ratio changing over LLR group ratios
-            llr_mean, llr_std = stats(llr_values)
-            plot(ax, ratios, llr_mean, f"{labels[erm_group_ratio]}", color=colors[idx], marker=None)
-            err(ax, ratios, llr_mean, llr_std, color=colors[idx])
-        """
-        # Set ticks, grid, and scale
-        ax.set_xscale("log")  # Set log scale for x-axis
-        ax.set_xticks(ratios)  # Log-scale ticks at the specified ratios
-        ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())  # Ensure ticks are shown as plain numbers
-        ax.set_ylim(0, 100)  # Start y-axis at 60
-        ax.grid(True, alpha=0.5)
+            # Plot triangles for ERM
+            erm_mean, erm_std = stats(erm_values)
+            plot(ax, ratios, erm_mean, f"ERM - {balance_method}", color="black", marker="^", linestyle="None")
+            err(ax, ratios, erm_mean, erm_std, color="black")
 
-        ax.set_xlabel("ERM Group Ratio (Log Scale)")
-        ax.set_ylabel("Test_WGA")
-        ax.legend(loc="best")
+            # For LLR lines: Iterate over ERM group ratios and calculate correlations
+            correlations = []
+            for idx, erm_group_ratio in enumerate(ratios):
+                llr_values = np.zeros((len(ratios), len(seeds)))  # Rows for LLR ratios, columns for seeds
+                for i, r in enumerate(ratios):
+                    for j, s in enumerate(seeds):
+                        try:
+                            llr_value = results[s]["base" if dataset_name in ["Civilcomments", "MultiNLI"] else 50]["upsampling" if dataset_name == "Waterbirds" else "subsetting"][erm_group_ratio]["llr"].get(balance_method, {}).get(r, {}).get(erm_epochs, {})
+                            if isinstance(llr_value, dict):
+                                llr_values[i, j] = llr_value.get("test_wga", np.nan)
+                            elif isinstance(llr_value, (float, int)):
+                                llr_values[i, j] = llr_value
+                            else:
+                                llr_values[i, j] = np.nan
+                        except KeyError as e:
+                            print(f"KeyError: {e}")
+                            llr_values[i, j] = np.nan
 
-   
-    # Plot for each balance method side by side
-    plot_data(axs[0], balance_methods[0])  # Plot for `upsampling`
-    axs[0].set_title(f"{dataset_name} - Upsampling")
+                llr_mean, llr_std = stats(llr_values)
+                plot(ax, ratios, llr_mean, f"{labels[erm_group_ratio]}", color=colors[idx], marker=None)
+                err(ax, ratios, llr_mean, llr_std, color=colors[idx])
 
-    # Adjust layout and save the plot
+                # Calculate and store the Pearson correlation coefficient
+                if not np.isnan(erm_mean).all() and not np.isnan(llr_mean).all():
+                    corr, _ = pearsonr(erm_mean, llr_mean)
+                    correlations.append((erm_group_ratio, corr))
+
+            ax.set_xscale("log")
+            ax.set_xticks(ratios)
+            ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
+            ax.set_ylim(35, 90)
+            ax.grid(True, alpha=0.5)
+
+            ax.set_xlabel("ERM Group Ratio (Log Scale)")
+            ax.set_ylabel("Test_WGA")
+            ax.legend(loc="best")
+
+            # Display correlation coefficients on the plot
+            correlation_text = "\n".join([f"LLR ratio: {grp}, r={corr:.2f}" for grp, corr in correlations])
+            ax.text(0.95, 0.05, correlation_text, transform=ax.transAxes, fontsize=12, verticalalignment='bottom', horizontalalignment='right', bbox=dict(facecolor='white', alpha=0.8))
+
+        plot_data(axes[i])
+        axes[i].set_title(f"{dataset_name} - Subsetting(ERM)_Upsampling(LLR)")
+
     plt.tight_layout()
 
     output_dir = "out"
     os.makedirs(output_dir, exist_ok=True)
     plt.savefig(osp.join(output_dir, f"{filename}.png"), bbox_inches='tight', dpi=600)
-
     plt.show()
 
-# Plot for Waterbirds with upsampling
-#plot_erm_llr("Celeba", celeba_results, ["upsampling"], 20, "Celeba_Upsampling")
-#plot_erm_llr("Waterbirds", waterbirds_results, ["upsampling"], 100, "Waterbirds_Upsampling")
-plot_erm_llr("Civilcomments", civilcomments_results, ["upsampling"], 20, "Civilcomments_Upsampling")
+# Dictionary containing results for all datasets
+results_dict = {
+    "Waterbirds": waterbirds_results,
+    "CelebA": celeba_results,
+    "Civilcomments": civilcomments_results,
+    "MultiNLI": multinli_results,
+}
+
+
+# Call the function with correlation coefficients
+plot_all_datasets_with_correlation(results_dict, "upsampling", "GroupRatio_with_Correlation")
+
+
+
