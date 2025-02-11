@@ -125,28 +125,18 @@ def experiment(args, model_class, datamodule_class):
 
     args.no_test = True
 
-    # Sets weights for class-balanced/group-balanced upweighting.
+    # Sets weights for class-balanced upweighting.
     args.class_weights = None
     args.group_weights = None
-    if args.balance_erm == "upweighting":
-        if args.balance_erm_type == "class":
-            if args.datamodule == "celeba":
-                args.class_weights = [1, 5.71]
-            elif args.datamodule == "civilcomments":
-                args.class_weights = [1, 7.85]
-            elif args.datamodule == "multinli":
-                args.class_weights = [1, 1, 1]
-            elif args.datamodule == "waterbirds":
-                args.class_weights = [1, 3.31]
-        elif args.balance_erm_type == "group":
-            if args.datamodule == "celeba":
-                args.group_weights = [1, 1.07, 3.21, 51.64]
-            elif args.datamodule == "civilcomments":
-                args.group_weights = [1, 1.64, 11.64, 8.33]
-            elif args.datamodule == "multinli":
-                args.group_weights = [1.17, 6.04, 1, 44.30, 1.01, 33.82]
-            elif args.datamodule == "waterbirds":
-                args.group_weights = [1, 19.01, 62.46, 3.31]
+    if args.balance_retrain == "upweighting":
+        if args.datamodule == "celeba":
+            args.class_weights = [1, 5.71]
+        elif args.datamodule == "civilcomments":
+            args.class_weights = [1, 7.85]
+        elif args.datamodule == "multinli":
+            args.class_weights = [1, 1, 1]
+        elif args.datamodule == "waterbirds":
+            args.class_weights = [1, 3.31]
                 
     find_erm_weights(args)
     
