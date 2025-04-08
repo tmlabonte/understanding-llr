@@ -142,6 +142,8 @@ class Model(pl.LightningModule):
             self.log(
                 name,
                 value,
+                # on_step=True,
+                # on_epoch=False,
                 on_step=(name in ("loss", "train_loss")),
                 on_epoch=(name not in ("loss", "train_loss")),
                 prog_bar=(name in ("train_acc", "val_loss", "val_acc")),
