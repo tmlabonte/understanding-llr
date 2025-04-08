@@ -404,5 +404,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     args.train_type = "erm"
-    args.results_pkl = f"{args.datamodule}_{args.model}.pkl"
+    args.results_pkl = f"svm_{args.datamodule}_{args.model}.pkl"
     experiment(args, models[args.model], datamodules[args.datamodule])

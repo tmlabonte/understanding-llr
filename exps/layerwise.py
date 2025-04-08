@@ -100,5 +100,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     args.train_type = "erm"
-    args.results_pkl = f"{args.datamodule}_{args.model}_layerwise.pkl"
+    args.results_pkl = f"{args.datamodule}_{args.model}_layerwise_100_epochs.pkl"
     experiment(args, models[args.model], datamodules[args.datamodule])
