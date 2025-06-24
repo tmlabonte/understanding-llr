@@ -36,7 +36,7 @@ HELDOUTS = [True, False]
 METRICS = ["test_aa", "test_acc_by_class", "test_acc_by_group",
             "test_wca", "test_wga", "train_aa", "train_acc_by_class",
             "train_acc_by_group", "train_wca", "train_wga", "version"]
-SEEDS = [1, 2, 3]
+SEEDS = [1,2,3,4,5,6,7,8,9,10]
 SPLITS = ["combined", "train"]
 TRAIN_TYPES = ["erm", "llr", "dfr"]
 
@@ -300,7 +300,7 @@ def dump_results(args, curr_epoch, curr_results):
         v = args.convnextv2_version
     elif args.model == "resnet":
         v = args.resnet_version
-        
+
     p = args.split
     c = args.balance_erm
     d = args.balance_retrain
@@ -312,20 +312,53 @@ def dump_results(args, curr_epoch, curr_results):
     h = args.heldout
     e = curr_epoch
 
-    # VERY important to load results right before dumping. Otherwise, we may
-    # overwrite results saved by different experiments.
+    #  Always load results before accessing it
     results = load_results(args)
+
     if t == "erm":
+        # Add missing key guards for the nested dict
+        if s not in results:
+            results[s] = {}
+        if v not in results[s]:
+            results[s][v] = {}
+        if p not in results[s][v]:
+            results[s][v][p] = {}
+        if c not in results[s][v][p]:
+            results[s][v][p][c] = {}
+        if t not in results[s][v][p][c]:
+            results[s][v][p][c][t] = {}
+        if e not in results[s][v][p][c][t]:
+            results[s][v][p][c][t][e] = {}
+
         for m in METRICS:
             if m in curr_results:
                 results[s][v][p][c][t][e][m] = curr_results[m]
     else:
+        if s not in results:
+            results[s] = {}
+        if v not in results[s]:
+            results[s][v] = {}
+        if p not in results[s][v]:
+            results[s][v][p] = {}
+        if c not in results[s][v][p]:
+            results[s][v][p][c] = {}
+        if t not in results[s][v][p][c]:
+            results[s][v][p][c][t] = {}
+        if h not in results[s][v][p][c][t]:
+            results[s][v][p][c][t][h] = {}
+        if d not in results[s][v][p][c][t][h]:
+            results[s][v][p][c][t][h][d] = {}
+        if e not in results[s][v][p][c][t][h][d]:
+            results[s][v][p][c][t][h][d][e] = {}
+
         for m in METRICS:
             if m in curr_results:
                 results[s][v][p][c][t][h][d][e][m] = curr_results[m]
-    
+
+    #  Save results safely
     with open(args.results_pkl, "wb") as f:
         pickle.dump(results, f)
+
 
 def experiment(args, model_class, datamodule_class):
     """Runs main training and evaluation procedure."""
