@@ -5,9 +5,10 @@ from milkshake.utils import ignore_warnings
 ignore_warnings()
 
 # Imports Python builtins.
+from copy import deepcopy
+from glob import glob
 import os.path as osp
 import pickle
-from copy import deepcopy
 
 # Imports Python packages.
 from configargparse import Parser
@@ -59,10 +60,10 @@ CLASS_BALANCING = {
 
 # Defines training epochs by dataset and pretraining type.
 EPOCHS = {
-    "celeba": list(range(20, 61, 20)),
-    "civilcomments": list(range(5, 61, 5)),
-    "multinli": list(range(20, 61, 20)),
-    "waterbirds": list(range(100, 301, 100)),
+    "celeba": list(range(1, 2, 1)),
+    "civilcomments": list(range(1, 2, 1)),
+    "multinli": list(range(1, 2, 1)),
+    "waterbirds": list(range(1, 2, 1)),
 }
 
 # Defines parameters for preset model sizes.
@@ -517,40 +518,6 @@ class FeatureCollapseMarginResNet(ResNet):
 
             self.log_helper2(names, values, dataloader_idx)
 
-    # def step_and_log_metrics(self, batch, idx, dataloader_idx, stage):
-    #     """Performs a step, then computes and logs metrics.
-
-    #     Args:
-    #         batch: A tuple containing the inputs and targets as torch.Tensor.
-    #         idx: The index of the given batch.
-    #         dataloader_idx: The index of the current dataloader.
-    #         stage: "train", "val", or "test".
-
-    #     Returns:
-    #         A dictionary containing the loss, prediction probabilities, targets, and metrics.
-    #     """
-
-    #     result = self.step(batch, idx)
-
-    #     accs = compute_accuracy(
-    #         result["probs"],
-    #         result["targets"],
-    #         self.hparams.num_classes,
-    #         self.hparams.num_groups,
-    #     )
-
-    #     self.add_metrics_to_result(result, accs, dataloader_idx)
-
-    #     self.log_metrics(result, stage, dataloader_idx)
-
-    #     # New addition to log margin metrics during the first epoch.
-    #     if idx % 2500 == 0:
-    #         collapse_metrics = self.compute_collapse_metrics()
-    #         self.log_margin_metrics(dataloader_idx)
-    #         self.log_metrics(collapse_metrics, "train", dataloader_idx)
-
-    #     return result
-
     def training_epoch_end(self, training_step_outputs):
         """Collates metrics upon completion of the training epoch.
 
@@ -945,40 +912,6 @@ class FeatureCollapseMarginBERT(BERT):
 
             self.log_helper2(names, values, dataloader_idx)
 
-    # def step_and_log_metrics(self, batch, idx, dataloader_idx, stage):
-    #     """Performs a step, then computes and logs metrics.
-
-    #     Args:
-    #         batch: A tuple containing the inputs and targets as torch.Tensor.
-    #         idx: The index of the given batch.
-    #         dataloader_idx: The index of the current dataloader.
-    #         stage: "train", "val", or "test".
-
-    #     Returns:
-    #         A dictionary containing the loss, prediction probabilities, targets, and metrics.
-    #     """
-
-    #     result = self.step(batch, idx)
-
-    #     accs = compute_accuracy(
-    #         result["probs"],
-    #         result["targets"],
-    #         self.hparams.num_classes,
-    #         self.hparams.num_groups,
-    #     )
-
-    #     self.add_metrics_to_result(result, accs, dataloader_idx)
-
-    #     self.log_metrics(result, stage, dataloader_idx)
-
-    #     # New addition to log margin metrics during the first epoch.
-    #     if idx % 3000 == 0:
-    #         collapse_metrics = self.compute_collapse_metrics()
-    #         self.log_margin_metrics(dataloader_idx)
-    #         self.log_metrics(collapse_metrics, "train", dataloader_idx)
-
-    #     return result
-
     def training_epoch_end(self, training_step_outputs):
         """Collates metrics upon completion of the training epoch.
 
@@ -1189,26 +1122,86 @@ def dump_results(args, curr_epoch, curr_results):
     with open(args.results_pkl, "wb") as f:
         pickle.dump(results, f)
 
+def reset_fc_hook(model):
+    """Resets model classifier parameters."""
+
+    try:
+        for layer in model.model.fc:
+            if hasattr(layer, "reset_parameters"):
+                layer.reset_parameters()
+    except:
+        try:
+            model.model.fc.reset_parameters()
+        except:
+            pass
+
+    try:
+        for layer in model.model.classifier:
+            if hasattr(layer, "reset_parameters"):
+                layer.reset_parameters()
+    except:
+        try:
+            model.model.classifier.reset_parameters()
+        except:
+            pass
+
+def train_fc_only(model):
+    """Freezes model parameters except for last layer."""
+
+    for p in model.model.parameters():
+        p.requires_grad = False
+
+    try:
+        for p in model.model.fc.parameters():
+            p.requires_grad = True
+    except:
+        for p in model.model.classifier.parameters():
+            p.requires_grad = True
+
+def set_llr_args(args, train_type):
+    """Sets args for last-layer retraining."""
+
+    new_args = deepcopy(args)
+
+    # Note that LLR is run for the same amount of epochs as ERM.
+    new_args.ckpt_every_n_epochs = new_args.max_epochs + 1
+    new_args.check_val_every_n_epoch = new_args.max_epochs
+    new_args.lr = 1e-2
+    new_args.lr_scheduler = "step"
+    new_args.lr_steps = []
+    new_args.optimizer = "sgd"
+    new_args.weight_decay = 0
+
+    if train_type == "llr":
+        new_args.train_type = "llr"
+        new_args.retrain_type = "group-unbalanced retraining"
+    elif train_type == "dfr":
+        new_args.train_type = "dfr"
+        new_args.retrain_type = "group-balanced retraining"
+
+    return new_args
+
 def experiment(args, model_class, datamodule_class):
     """Runs main training and evaluation procedure."""
 
-    args.no_test = True
+    # args.no_test = True
+    # find_erm_weights(args)
+    
+    datamodule = datamodule_class(args)
+    datamodule.setup()
 
-    # Sets class weights for loss-based class-balancing.
-    # MultiNLI is class-balanced a priori, so we do not include it here.
-    if args.balance_erm == "upweighting":
-        if args.datamodule == "celeba":
-            args.class_weights = [1, 5.71]
-        elif args.datamodule == "civilcomments":
-            args.class_weights = [1, 7.85]
-        elif args.datamodule == "waterbirds":
-            args.class_weights = [1, 3.31]
+    args.num_classes = datamodule.num_classes
+    args.num_groups = datamodule.num_groups
 
-    # Creates results dict if it does not exist.
-    if not osp.isfile(args.results_pkl):
-        load_results(args)
+    model = model_class(args)
+    model = load_weights(args, model)
 
-    main(args, model_class, datamodule_class)
+    # Performs LLR.
+    new_args = set_llr_args(args, "llr")
+    model.hparams.train_type = "llr" # Used for dumping results
+    train_fc_only(model)
+    model, _, _ = main(
+        new_args, model, datamodule_class, model_hooks=[reset_fc_hook])
     
 if __name__ == "__main__":
     parser = Parser(
@@ -1247,5 +1240,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     args.train_type = "erm"
-    args.results_pkl = f"{args.datamodule}_{args.model}_collapse_margin_seed_1_epochs_20_40.pkl"
+    args.results_pkl = f"{args.datamodule}_{args.model}_collapse_margin_short.pkl"
     experiment(args, models[args.model], datamodules[args.datamodule])

@@ -72,6 +72,18 @@ def load_weights(args, model):
             # Loads just the weights from args.weights.
             checkpoint = torch.load(args.weights, map_location="cpu")
             state_dict = checkpoint["state_dict"]
+
+            # Optionally clean up the keys if you're using PyTorch Lightning and they’re prefixed
+            # For example, if the state_dict keys look like "model.classifier.weight"
+            # You might need to remove "model." prefix, depending on how `model` is structured.
+            # Uncomment if needed:
+            # state_dict = {k.replace("model.", ""): v for k, v in state_dict.items()}
+
+            # Remove the classifier weights from the checkpoint
+            state_dict.pop("model.classifier.weight", None)
+            state_dict.pop("model.classifier.bias", None)
+
+            # Load the rest of the weights (ignore missing classifier weights)
             model.load_state_dict(state_dict, strict=False)
             print(f"Weights loaded from {args.weights}.")
 
@@ -203,6 +215,12 @@ def main(
     trainer = load_trainer(args, addtl_callbacks=callbacks)
     if not args.eval_only:
         trainer.fit(model, datamodule=datamodule, ckpt_path=args.ckpt_path)
+    # else:
+    #     # Add this block to setup dataloaders even in eval-only mode
+    #     datamodule.setup('fit')  # This sets up train/val splits
+    #     model.trainer = trainer  # Ensure the model has access to trainer
+    #     # Explicitly set the train_dataloader on the trainer
+    #     trainer.train_dataloader = datamodule.train_dataloader()
 
     # Reloads trainer for validation and testing. Must use a single device.
     # Note that this procedure resets the "epoch" and "step" trainer metrics.
