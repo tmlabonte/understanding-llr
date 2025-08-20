@@ -12,12 +12,16 @@ from copy import deepcopy
 # Imports Python packages.
 from configargparse import Parser
 import numpy as np
+import math
 from distutils.util import strtobool
 
 # Imports PyTorch packages.
 import torch
 from pytorch_lightning import Trainer
 import torch.nn.functional as F
+
+# Imports Sklearn packages.
+from scipy.sparse.linalg import LinearOperator, cg
 
 # Imports milkshake packages.
 from milkshake.args import add_input_args
@@ -127,7 +131,7 @@ def get_vectorized_features(targets, features, num_classes, num_groups):
 
     # Vectorizes the batch features.
     batch_size = features.size(0)
-    batch_vectorized_features = features.view(batch_size, -1)#.to(torch.float16)
+    batch_vectorized_features = features.view(batch_size, -1)
 
     # Collates class features.
     features_by_class = {}
@@ -139,8 +143,8 @@ def get_vectorized_features(targets, features, num_classes, num_groups):
             features_by_class[j] = class_features
 
     # Collates group features.
+    features_by_group = {}
     if num_groups:
-        features_by_group = {}
         for j in range(num_groups):
             group_features = batch_vectorized_features[groups == j]
             if j in features_by_group:
@@ -156,10 +160,58 @@ def get_vectorized_features(targets, features, num_classes, num_groups):
 
     return vectorized_features
 
+
+def conjugate_gradient_torch(A_func, b, x0=None, tol=1e-5, maxiter=None):
+    """
+    Pure PyTorch implementation of conjugate gradient solver.
+    
+    Args:
+        A_func: Function that computes A @ x for any vector x
+        b: Right-hand side vector
+        x0: Initial guess (default: zeros)
+        tol: Convergence tolerance
+        maxiter: Maximum iterations (default: size of b)
+    
+    Returns:
+        x: Solution vector
+        info: 0 if converged, >0 indicates number of iterations at non-convergence
+    """
+    n = b.shape[0]
+    if maxiter is None:
+        maxiter = n
+    
+    if x0 is None:
+        x = torch.zeros_like(b)
+    else:
+        x = x0.clone()
+    
+    r = b - A_func(x)
+    p = r.clone()
+    rsold = torch.dot(r, r)
+    
+    for i in range(maxiter):
+        Ap = A_func(p)
+        alpha = rsold / torch.dot(p, Ap)
+        x = x + alpha * p
+        r = r - alpha * Ap
+        rsnew = torch.dot(r, r)
+        
+        if torch.sqrt(rsnew) < tol:
+            return x, 0
+            
+        beta = rsnew / rsold
+        p = r + beta * p
+        rsold = rsnew
+    
+    return x, maxiter
+
+
 class FeatureCollapseMarginResNet(ResNet):
     def __init__(self, args):
         super().__init__(args)
         self.features = None
+        # Set this to False to use scipy CG on CPU (can be better for very large problems)
+        self.use_gpu_cg = False
         
     @torch.no_grad()
     def get_global_feature_info(self):
@@ -178,6 +230,7 @@ class FeatureCollapseMarginResNet(ResNet):
         global_mean = 0
         class_means = [0] * self.hparams.num_classes
         group_means = [0] * self.hparams.num_groups
+        
         for idx, batch in enumerate(self.trainer.train_dataloader):
             batch[0] = batch[0].cuda()
             batch[1] = batch[1].cuda()
@@ -194,19 +247,29 @@ class FeatureCollapseMarginResNet(ResNet):
             global_mean += torch.sum(features["features"], dim=0)
 
             for j in range(self.hparams.num_classes):
-                num_samples_per_class[j] += sum([1 for t in result["targets"][:, 0] if t == j])
-                class_means[j] += torch.sum(features["features_by_class"][j], dim=0)
+                if j in features["features_by_class"]:
+                    num_samples_per_class[j] += len(features["features_by_class"][j])
+                    class_means[j] += torch.sum(features["features_by_class"][j], dim=0)
 
             for j in range(self.hparams.num_groups):
-                num_samples_per_group[j] += sum([1 for t in result["targets"][:, 1] if t == j])
-                group_means[j] += torch.sum(features["features_by_group"][j], dim=0)
+                if j in features["features_by_group"]:
+                    num_samples_per_group[j] += len(features["features_by_group"][j])
+                    group_means[j] += torch.sum(features["features_by_group"][j], dim=0)
 
         global_mean /= num_samples
 
         for j in range(self.hparams.num_classes):
-            class_means[j] /= num_samples_per_class[j]
+            if num_samples_per_class[j] > 0:
+                class_means[j] /= num_samples_per_class[j]
+            else:
+                class_means[j] = torch.zeros_like(global_mean)
+                
         for j in range(self.hparams.num_groups):
-            group_means[j] /= num_samples_per_group[j]
+            if num_samples_per_group[j] > 0:
+                group_means[j] /= num_samples_per_group[j]
+            else:
+                group_means[j] = torch.zeros_like(global_mean)
+                
         class_means = torch.stack(class_means)
         group_means = torch.stack(group_means)
 
@@ -214,9 +277,9 @@ class FeatureCollapseMarginResNet(ResNet):
 
     @torch.no_grad()
     def compute_covariance_matrices(self, num_samples, global_mean, mode_means, mode=None):
-        """Performs computation of covariance matrices for feature collapse.
-
-        TODO: Clean this up, is "mode" the best way or make multiple methods?
+        """Performs memory-efficient computation of covariance matrices for feature collapse.
+        
+        Uses stochastic trace estimation and conjugate gradient to avoid storing full matrices.
 
         Args:
             num_samples: The number of samples in the training dataset.
@@ -225,117 +288,200 @@ class FeatureCollapseMarginResNet(ResNet):
             mode: Either "total", "class", or "group".
 
         Returns:
-            cov_norm: The Frobenius norm of the covariance matrix.
-            trace: The trace of the inter/intra matmul (signal-to-noise ratio).
+            Various norms and traces depending on mode.
         """
-
-        torch.cuda.empty_cache()  # Good practice, but might need more aggressive memory management
-
-        if mode == "total":
-            total_cov = 0
-        elif mode == "class":
-            inter_class_cov = 0
-            intra_class_cov = 0
-        elif mode == "group":
-            inter_group_cov = 0
-            intra_group_cov = 0
-
-        for idx, batch in enumerate(self.trainer.train_dataloader):
-            batch[0] = batch[0].cuda()
-            batch[1] = batch[1].cuda()
-            result = self.step(batch, idx)
-
-            # TODO: Perhaps compute only the features we need based on mode.
-            features = get_vectorized_features(
-                result["targets"],
-                self.features,
-                self.hparams.num_classes,
-                self.hparams.num_groups,
-            )
-
-            if mode == "total":
-                features = features["features"] - global_mean
-                for sample_features in features:
-                    total_cov += torch.outer(sample_features, sample_features)
-            elif mode == "class":
-                class_features = []
-                for j in range(self.hparams.num_classes):
-                    class_features.append(features["features_by_class"][j] - mode_means[j])
-                class_features = torch.cat(class_features)
-
-                for sample_features in class_features:
-                    intra_class_cov += torch.outer(sample_features, sample_features)
-            elif mode == "group":
-                group_features = []
-                for j in range(self.hparams.num_groups):
-                    group_features.append(features["features_by_group"][j] - mode_means[j])
-                group_features = torch.cat(group_features)
-
-                for sample_features in group_features:
-                    intra_group_cov += torch.outer(sample_features, sample_features)
-
-        if mode == "total":
-            total_cov /= num_samples
-            total_cov_norm = torch.norm(total_cov, p="fro")
-            return total_cov_norm
-        elif mode == "class":
-            centered_class_means = mode_means - global_mean
-            for class_mean in centered_class_means:
-                inter_class_cov += torch.outer(class_mean, class_mean)
-
-            inter_class_cov /= self.hparams.num_classes
-            intra_class_cov /= num_samples
-
-            inter_class_cov_norm = torch.norm(inter_class_cov, p="fro")
-            intra_class_cov_norm = torch.norm(intra_class_cov, p="fro")
-
-            # Debugging the matrices
-            print("intra_class_cov shape:", intra_class_cov.shape)
-            print("inter_class_cov shape:", inter_class_cov.shape)
-            print("Any NaN in intra_class_cov:", torch.isnan(intra_class_cov).any())
-            print("Any NaN in inter_class_cov:", torch.isnan(inter_class_cov).any())
-
-            # Handle NaN values if found
-            intra_class_cov = torch.nan_to_num(intra_class_cov, nan=0.0)
-            inter_class_cov = torch.nan_to_num(inter_class_cov, nan=0.0)
-
-            # The problematic line
-            # class_trace = (intra_class_cov * torch.linalg.pinv(inter_class_cov, hermitian=True).t()).sum() / self.hparams.num_classes
-            epsilon = 1e-3  # Adjust as needed
-            inter_class_cov_reg = inter_class_cov + torch.eye(inter_class_cov.shape[0], device=inter_class_cov.device) * epsilon
-            class_trace = (intra_class_cov * torch.linalg.pinv(inter_class_cov_reg, hermitian=True).t()).sum() / self.hparams.num_classes
+        
+        torch.cuda.empty_cache()
+        
+        feature_dim = global_mean.shape[0]
+        num_modes = mode_means.shape[0] if mode != "total" else 0
+        
+        # Helper function to apply covariance matrix-vector products
+        def apply_cov_matvec(v, centered_features_fn, num_samples_cov):
+            """Applies covariance matrix to vector v without forming the matrix."""
+            result = torch.zeros_like(v)
             
-            return inter_class_cov_norm, intra_class_cov_norm, class_trace
+            for idx, batch in enumerate(self.trainer.train_dataloader):
+                batch[0] = batch[0].cuda()
+                batch[1] = batch[1].cuda()
+                result_batch = self.step(batch, idx)
+                
+                features = get_vectorized_features(
+                    result_batch["targets"],
+                    self.features,
+                    self.hparams.num_classes,
+                    self.hparams.num_groups,
+                )
+                
+                centered_feats = centered_features_fn(features, result_batch)
+                
+                if centered_feats.numel() > 0:  # Check if there are features
+                    # Compute (1/n) * F^T * F * v = (1/n) * F^T * (F * v)
+                    # More efficient: compute Fv first (matrix-vector), then F^T(Fv)
+                    Fv = torch.mv(centered_feats, v)  # (n_samples,)
+                    result += torch.mv(centered_feats.t(), Fv) / num_samples_cov
+                    
+            return result
+        
+        # Compute Frobenius norm using stochastic trace estimation
+        def estimate_frobenius_norm(centered_features_fn, num_samples_cov, num_random_vecs=1):
+            """Estimates Frobenius norm using Hutchinson's trace estimator."""
+            trace_estimate = 0.0
+            
+            for _ in range(num_random_vecs):
+                # Random Rademacher vector (more efficient than Gaussian for trace estimation)
+                z = torch.randint(0, 2, (feature_dim,), device='cuda', dtype=torch.float32) * 2 - 1
+                z = z / np.sqrt(num_random_vecs)
+                
+                Cz = apply_cov_matvec(z, centered_features_fn, num_samples_cov)
+                trace_estimate += torch.dot(z, Cz).item()
+                
+            return np.sqrt(max(0, trace_estimate))  # Ensure non-negative due to numerical errors
+        
+        if mode == "total":
+            def centered_features_total(features, result_batch):
+                return features["features"] - global_mean
+            
+            total_cov_norm = estimate_frobenius_norm(centered_features_total, num_samples)
+            return total_cov_norm
+            
+        elif mode == "class":
+            def centered_features_intra_class(features, result_batch):
+                class_features_list = []
+                for j in range(self.hparams.num_classes):
+                    if j in features["features_by_class"] and len(features["features_by_class"][j]) > 0:
+                        class_features_list.append(features["features_by_class"][j] - mode_means[j])
+                if class_features_list:
+                    return torch.cat(class_features_list, dim=0)
+                else:
+                    return torch.empty(0, feature_dim, device='cuda')
+            
+            # Compute intra-class covariance norm
+            intra_class_cov_norm = estimate_frobenius_norm(centered_features_intra_class, num_samples)
+            
+            # Compute inter-class covariance (low-rank, so we can compute it directly)
+            centered_class_means = mode_means - global_mean
+            # Normalize: (1/K) * M^T * M
+            inter_class_cov_norm = torch.norm(centered_class_means, p='fro') / np.sqrt(self.hparams.num_classes)
+            
+            # Function to apply inter-class covariance
+            def apply_inter_class_cov(v):
+                # (1/K) * M^T * M * v where M = centered_class_means^T
+                Mv = torch.mv(centered_class_means, v)
+                return torch.mv(centered_class_means.t(), Mv) / self.hparams.num_classes
+            
+            # Add regularization for numerical stability
+            epsilon = 1e-3
+            def apply_inter_class_cov_reg(v):
+                return apply_inter_class_cov(v) + epsilon * v
+            
+            # Compute trace(intra * pinv(inter)) using stochastic estimation
+            trace_estimate = 0.0
+            num_trace_samples = 1
+            
+            for _ in range(num_trace_samples):
+                # Random vector for trace estimation
+                z = torch.randn(feature_dim, device='cuda', dtype=torch.float32)
+                z = z / np.sqrt(num_trace_samples)
+                
+                # Apply intra-class covariance
+                intra_z = apply_cov_matvec(z, centered_features_intra_class, num_samples)
+                
+                # Solve inter_class_cov_reg * x = intra_z
+                if self.use_gpu_cg:
+                    # Pure GPU implementation
+                    x_solution, info = conjugate_gradient_torch(
+                        apply_inter_class_cov_reg, 
+                        intra_z, 
+                        tol=1e-5, 
+                        maxiter= feature_dim #min(100, feature_dim)
+                    )
+                    if info > 0:
+                        print(f"GPU CG did not converge in {info} iterations")
+                else:
+                    # CPU implementation with scipy
+                    A_op = LinearOperator(
+                        shape=(feature_dim, feature_dim),
+                        matvec=lambda x: apply_inter_class_cov_reg(
+                            torch.from_numpy(x).cuda().float()
+                        ).cpu().numpy(),
+                        dtype=np.float32
+                    )
+                    x_solution, info = cg(A_op, intra_z.cpu().numpy(), rtol=1e-5, maxiter=feature_dim)
+                    if info != 0:
+                        print(f"CPU CG did not converge: info={info}")
+                    x_solution = torch.from_numpy(x_solution).cuda().float()
+                
+                trace_estimate += torch.dot(z, x_solution).item()
+            
+            class_trace = trace_estimate / self.hparams.num_classes
+            
+            return inter_class_cov_norm.item(), intra_class_cov_norm, class_trace
+            
         elif mode == "group":
+            def centered_features_intra_group(features, result_batch):
+                group_features_list = []
+                for j in range(self.hparams.num_groups):
+                    if j in features["features_by_group"] and len(features["features_by_group"][j]) > 0:
+                        group_features_list.append(features["features_by_group"][j] - mode_means[j])
+                if group_features_list:
+                    return torch.cat(group_features_list, dim=0)
+                else:
+                    return torch.empty(0, feature_dim, device='cuda')
+            
+            # Compute intra-group covariance norm
+            intra_group_cov_norm = estimate_frobenius_norm(centered_features_intra_group, num_samples)
+            
+            # Compute inter-group covariance
             centered_group_means = mode_means - global_mean
-            for group_mean in centered_group_means:
-                inter_group_cov += torch.outer(group_mean, group_mean)
-
-            inter_group_cov /= self.hparams.num_groups
-            intra_group_cov /= num_samples
-
-            inter_group_cov_norm = torch.norm(inter_group_cov, p="fro")
-            intra_group_cov_norm = torch.norm(intra_group_cov, p="fro")
-
-            # Debugging the matrices
-            print("intra_group_cov shape:", intra_group_cov.shape)
-            print("inter_group_cov shape:", inter_group_cov.shape)
-            print("Any NaN in intra_group_cov:", torch.isnan(intra_group_cov).any())
-            print("Any NaN in inter_group_cov:", torch.isnan(inter_group_cov).any())
-
-            # Handle NaN values if found
-            intra_group_cov = torch.nan_to_num(intra_group_cov, nan=0.0)
-            inter_group_cov = torch.nan_to_num(inter_group_cov, nan=0.0)
-
-            # The problematic line
-            # group_trace = (intra_group_cov * torch.linalg.pinv(inter_group_cov, hermitian=True).t()).sum() / self.hparams.num_groups
-            epsilon = 1e-3  # Adjust as needed
-            inter_group_cov_reg = inter_group_cov + torch.eye(inter_group_cov.shape[0], device=inter_group_cov.device) * epsilon
-            group_trace = (intra_group_cov * torch.linalg.pinv(inter_group_cov_reg, hermitian=True).t()).sum() / self.hparams.num_groups
-
-
-
-            return inter_group_cov_norm, intra_group_cov_norm, group_trace
+            inter_group_cov_norm = torch.norm(centered_group_means, p='fro') / np.sqrt(self.hparams.num_groups)
+            
+            # Function to apply inter-group covariance
+            def apply_inter_group_cov(v):
+                Mv = torch.mv(centered_group_means, v)
+                return torch.mv(centered_group_means.t(), Mv) / self.hparams.num_groups
+            
+            epsilon = 1e-3
+            def apply_inter_group_cov_reg(v):
+                return apply_inter_group_cov(v) + epsilon * v
+            
+            # Compute trace
+            trace_estimate = 0.0
+            num_trace_samples = 1
+            
+            for _ in range(num_trace_samples):
+                z = torch.randn(feature_dim, device='cuda', dtype=torch.float32)
+                z = z / np.sqrt(num_trace_samples)
+                
+                intra_z = apply_cov_matvec(z, centered_features_intra_group, num_samples)
+                
+                if self.use_gpu_cg:
+                    x_solution, info = conjugate_gradient_torch(
+                        apply_inter_group_cov_reg,
+                        intra_z,
+                        tol=1e-5,
+                        maxiter=feature_dim #min(100, feature_dim)
+                    )
+                    if info > 0:
+                        print(f"GPU CG did not converge in {info} iterations")
+                else:
+                    A_op = LinearOperator(
+                        shape=(feature_dim, feature_dim),
+                        matvec=lambda x: apply_inter_group_cov_reg(
+                            torch.from_numpy(x).cuda().float()
+                        ).cpu().numpy(),
+                        dtype=np.float32
+                    )
+                    x_solution, info = cg(A_op, intra_z.cpu().numpy(), rtol=1e-5, maxiter=feature_dim)
+                    if info != 0:
+                        print(f"CPU CG did not converge: info={info}")
+                    x_solution = torch.from_numpy(x_solution).cuda().float()
+                
+                trace_estimate += torch.dot(z, x_solution).item()
+            
+            group_trace = trace_estimate / self.hparams.num_groups
+            
+            return inter_group_cov_norm.item(), intra_group_cov_norm, group_trace
 
     def compute_collapse_metrics(self):
         """Performs feature collapse metrics computation.

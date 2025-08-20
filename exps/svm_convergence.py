@@ -171,6 +171,7 @@ class SVMBERT(BERT):
         self.features = None
         self.svm_weights_normalized = None
         self.svm_trained = False
+        self.num_classes = args.num_classes
 
         # Registers model hook to get BERT features.
         def get_features():
@@ -228,18 +229,38 @@ class SVMBERT(BERT):
             labels = labels.cpu()
             svm.fit(features, labels[:, 0])
 
-            svm_weights = svm.coef_
-            svm_weights_normalized = svm_weights / np.linalg.norm(svm_weights)
+            if self.num_classes == 1:
+                svm_weights = svm.coef_
+                svm_weights_normalized = svm_weights / np.linalg.norm(svm_weights)
 
-            self.svm_weights_normalized = svm_weights_normalized
+                self.svm_weights_normalized = svm_weights_normalized
+            else:
+                svm_weights = svm.coef_  # shape: [num_classes, feature_dim]
+                svm_weights_normalized = svm_weights / np.linalg.norm(svm_weights, axis=1, keepdims=True)
+
+                self.svm_weights_normalized = svm_weights_normalized
 
             self.svm_trained = True
 
             print("SVM Trained")
 
         # Similarity Metrics
-        cosine_similarity = np.dot(self.svm_weights_normalized.flatten(), nn_fc_weights_normalized.flatten())
-        directional_error = np.linalg.norm(nn_fc_weights_normalized - self.svm_weights_normalized)
+
+        if self.num_classes == 1:
+            cosine_similarity = np.dot(self.svm_weights_normalized.flatten(), nn_fc_weights_normalized.flatten())
+            directional_error = np.linalg.norm(nn_fc_weights_normalized - self.svm_weights_normalized)
+        else:
+            # Normalize the NN weights per class
+            nn_fc_weights_normalized = nn_fc_weights_cpu / np.linalg.norm(nn_fc_weights_cpu, axis=1, keepdims=True)
+            nn_fc_weights_normalized = nn_fc_weights_normalized.cpu().numpy()
+
+            # Cosine similarities and directional errors per class
+            cosine_similarities = np.sum(self.svm_weights_normalized * nn_fc_weights_normalized, axis=1)
+            directional_errors = np.linalg.norm(nn_fc_weights_normalized - self.svm_weights_normalized, axis=1)
+
+            # Aggregate metrics
+            cosine_similarity = np.mean(cosine_similarities)
+            directional_error = np.mean(directional_errors)
 
         svm_metrics = {
             "cosine_similarity": cosine_similarity,

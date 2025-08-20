@@ -11,5 +11,5 @@ metrics: [loss, acc, acc_by_class, acc_by_group, global_cov, inter_class_cov, in
 model: resnet
 num_sanity_val_steps: 0
 optimizer: adamw
-resnet_version: 18
+resnet_version: 50
 wandb: True

@@ -8,7 +8,8 @@ lr: 1e-5
 lr_scheduler: cosine
 max_epochs: 1000
 metrics: [loss, acc, acc_by_class, acc_by_group, cosine_similarity, directional_error]
-model: convnextv2
+model: resnet
+resnet_version: 50
 num_sanity_val_steps: 0
 optimizer: adamw
 wandb: True
