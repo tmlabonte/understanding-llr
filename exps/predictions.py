@@ -10,8 +10,43 @@ from milkshake.utils import ignore_warnings
 from milkshake.main import main, load_weights
 from milkshake.args import add_input_args
 from exps.finetune import *
+import hashlib, json
+from itertools import islice
+from torch.utils.data import DataLoader, ConcatDataset
+import torch.nn as nn
 
-ignore_warnings()
+
+
+def _as_int(x, default=-1):
+    try: return int(x)
+    except: return default
+
+
+
+def rebuild_head(m, num_classes):
+    # BERT
+    if hasattr(m.model, "classifier") and hasattr(m.model.classifier, "in_features"):
+        in_f = m.model.classifier.in_features
+        m.model.classifier = nn.Linear(in_f, num_classes)
+        return ("classifier", in_f, num_classes)
+    # ResNet/ConvNeXt
+    if hasattr(m.model, "fc") and hasattr(m.model.fc, "in_features"):
+        in_f = m.model.fc.in_features
+        m.model.fc = nn.Linear(in_f, num_classes)
+        return ("fc", in_f, num_classes)
+    return ("unknown", None, None)
+
+def _head_shape(m):
+    try:
+        return tuple(m.model.classifier.weight.shape)
+    except Exception:
+        try:
+            return tuple(m.model.fc.weight.shape)
+        except Exception:
+            return None
+
+
+
 
 def reset_fc_hook(model):
     try:
@@ -57,31 +92,68 @@ def set_llr_args(args, train_type):
     return new_args
 
 def find_erm_weights(args):
+    """Retrieves ERM weights from pickle file based on model config, with debug prints."""
     args.train_type = "erm"
 
+    if not osp.isfile(args.results_pkl):
+        raise ValueError(f"Results file {args.results_pkl} not found.")
+
+    results = load_results(args)
+
+    # Resolve keys
+    s = args.seed
     if args.model == "bert":
         v = args.bert_version
     elif args.model == "convnextv2":
         v = args.convnextv2_version
     elif args.model == "resnet":
         v = args.resnet_version
-        
-    if not osp.isfile(args.results_pkl):
-        raise ValueError(f"Results file {args.results_pkl} not found.")
-    results = load_results(args)
-    s = args.seed
-    v = getattr(args, f"{args.model}_version")
+    else:
+        raise ValueError(f"Unknown model type: {args.model}")
+
     p = args.split
     c = args.balance_erm
-    if "mixture" in c:
+    if isinstance(c, str) and "mixture" in c:
         c += str(args.mixture_ratio)
     e = args.max_epochs
-    wandb_version = results[s][v][p][c]["erm"][e]["version"]
+
+    # Debug print of the exact lookup tuple
+    print(f"[ERM] lookup keys -> seed(s)={s}  version(v)={v}  split(p)={p}  balance(c)={c}  epochs(e)={e}")
+
+    try:
+        wandb_version = results[s][v][p][c]["erm"][e]["version"]
+    except KeyError as ke:
+        # Extra context to help you see what's present when something mismatches
+        def _keys(x): 
+            return list(x.keys()) if isinstance(x, dict) else type(x).__name__
+        msg = [
+            "[ERM] KeyError during results lookup.",
+            f"  available seeds: {_keys(results)}",
+        ]
+        try: msg.append(f"  available versions for seed {s}: {_keys(results[s])}")
+        except: pass
+        try: msg.append(f"  available splits for (s={s}, v={v}): {_keys(results[s][v])}")
+        except: pass
+        try: msg.append(f"  available balances for (s={s}, v={v}, p={p}): {_keys(results[s][v][p])}")
+        except: pass
+        try: msg.append(f"  available train_types for (.., c={c}): {_keys(results[s][v][p][c])}")
+        except: pass
+        try: msg.append(f"  available epochs for (.., 'erm'): {_keys(results[s][v][p][c]['erm'])}")
+        except: pass
+        raise KeyError("\n".join(msg)) from ke
+
     if not wandb_version:
-        raise ValueError(f"Model version {wandb_version} not found.")
+        raise ValueError(f"[ERM] Model version not found for keys s={s}, v={v}, p={p}, c={c}, e={e}.")
+
+    # Resolve checkpoint path and print it
     fpath = "epoch=" + f"{e - 1:02d}" + "*"
     ckpt_path = osp.join(args.wandb_dir, "lightning_logs", wandb_version, "checkpoints", fpath)
-    args.weights = glob(ckpt_path)[0]
+    matches = glob(ckpt_path)
+    if not matches:
+        raise FileNotFoundError(f"[ERM] No checkpoint matched {ckpt_path}")
+    args.weights = matches[0]
+    print(f"[ERM] resolved -> wandb_version={wandb_version}  ckpt={args.weights}")
+
 
 def ensemble_predictions(models, dataloader, device):
     preds = []
@@ -98,6 +170,27 @@ def ensemble_predictions(models, dataloader, device):
     avg_logits = torch.mean(torch.stack(preds), dim=0)  #Compute average prediction over models
     return avg_logits, torch.argmax(avg_logits, dim=1)
 
+def dump_hparams(tag, args, trainer_args=None):
+    keys = ["seed","max_epochs","batch_size","lr","optimizer","weight_decay",
+            "lr_scheduler","lr_steps","train_type","retrain_type",
+            "balance_erm","balance_erm_type","balance_retrain","split","train_pct"]
+    msg = {k: getattr(args, k, None) for k in keys}
+    if trainer_args:
+        msg.update({f"trainer.{k}": trainer_args.get(k) for k in trainer_args})
+    h = hashlib.sha256(json.dumps(msg, sort_keys=True).encode()).hexdigest()
+    print(f"[HP] {tag}: {msg}\n[HP] hash={h}")
+    return h
+
+def _collect_trainer_args(args):
+    # Pull a few trainer-related fields if present on args (won’t fail if missing)
+    fields = ["deterministic","accelerator","devices","precision","gradient_clip_val",
+              "accumulate_grad_batches","max_epochs","log_every_n_steps"]
+    out = {}
+    for f in fields:
+        if hasattr(args, f):
+            out[f] = getattr(args, f)
+    return out
+
 def experiment(args, model_class, datamodule_class):
     args.no_test = True
     args.class_weights = None
@@ -112,51 +205,56 @@ def experiment(args, model_class, datamodule_class):
         elif args.datamodule == "waterbirds":
             args.class_weights = [1, 3.31]
 
-    
+    # Build base datamodule once to discover counts
+    base_dm = datamodule_class(args)
+    base_dm.setup()
+    args.num_classes = base_dm.num_classes
+    args.num_groups  = base_dm.num_groups
 
-    find_erm_weights(args)
-    datamodule = datamodule_class(args)
-    datamodule.setup()
-    args.num_classes = datamodule.num_classes
-    args.num_groups = datamodule.num_groups
-    model = model_class(args)
-    model = load_weights(args, model)
+    trainer_args0 = _collect_trainer_args(args)
 
-    retrained_models = []
-    for i in range(15):
+
+    for i in range(5):
+        # 1) derive per-run args (with new seed)
         new_args = set_llr_args(args, "dfr")
         if args.datamodule == "civilcomments":
             new_args.lr = 1e-3
-        new_args.seed = args.seed + i  # ensure different validation splits
-        model_i = deepcopy(model)
+        new_args.seed = args.seed + i
+
+        # keep dataset-dependent counts in new_args
+        new_args.num_classes = args.num_classes
+        new_args.num_groups  = args.num_groups
+
+        dump_hparams(f"retrain_run_{i}", new_args, trainer_args=trainer_args0)
+
+        # 2) re-resolve ERM checkpoint for THIS seed/split/balance/epochs
+        find_erm_weights(new_args)                 # prints s,v,p,c,e and resolves ckpt
+        print(f"[ENC] run {i} ERM ckpt: {new_args.weights}")
+
+        # 3) build a fresh model and load the run’s ERM encoder
+        model_i = model_class(new_args)
+        model_i = load_weights(new_args, model_i)
+
+        # 4) ensure head matches dataset; freeze encoder
+        _ = rebuild_head(model_i, args.num_classes)
+        print(f"[HEAD] run {i} head shape={_head_shape(model_i)}  num_classes={args.num_classes}")
         model_i.hparams.train_type = "dfr"
+        model_i.hparams.num_classes = args.num_classes
+        model_i.hparams.num_groups  = args.num_groups
         train_fc_only(model_i)
+
+        # 5) build per-run datamodule (seed affects splits), fingerprint
+        dm_check = datamodule_class(new_args)
+        dm_check.setup()
+        _ = peek_and_fingerprint_datamodule(dm_check, peek=5)
+
+        # 6) train last layer
         main(new_args, model_i, datamodule_class, model_hooks=[reset_fc_hook])
-        if args.datamodule == "civilcomments":
-            retrained_models.append(deepcopy(model_i.state_dict()))
-        else:
-            retrained_models.append(deepcopy(model_i))
 
 
-    test_loader = datamodule.test_dataloader()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if args.datamodule == "civilcomments":
-        models_for_eval = []
-        for state_dict in retrained_models:
-            m = model_class(args)
-            m.load_state_dict(state_dict)
-            m.to(device)
-            m.eval()
-            models_for_eval.append(m)
-        avg_logits, predictions = ensemble_predictions(models_for_eval, test_loader, device)
-    else:
-        avg_logits, predictions = ensemble_predictions(retrained_models, test_loader, device)
 
-    # Evaluate ensemble classifier accuracy
-    y_true = torch.cat([batch[1] for batch in test_loader])  # assumes batch[1] contains labels
-    from sklearn.metrics import accuracy_score
-    accuracy = accuracy_score(y_true.numpy(), predictions.numpy())
-    print(f"Ensemble Accuracy: {accuracy:.4f}")
+
+
 
 if __name__ == "__main__":
     parser = Parser(args_for_setting_config_path=["-c", "--cfg", "--config"], config_arg_is_required=True)
@@ -171,6 +269,9 @@ if __name__ == "__main__":
     parser.add("--split", choices=["combined", "train"], default="train")
     parser.add("--train_pct", default=100, type=int)
     parser.add("--retrain_type", choices=["llr", "dfr", "both"], default="both")
+
+    parser.add("--erm_ckpt_override", type=str, default=None,
+        help="Absolute path to a fixed ERM checkpoint to initialize the encoder.")
 
     datamodules = {
         "celeba": CelebARetrain,
