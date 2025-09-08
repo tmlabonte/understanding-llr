@@ -146,20 +146,25 @@ def experiment(args, model_class, datamodule_class):
     args.num_classes = datamodule.num_classes
     args.num_groups = datamodule.num_groups
 
-    model = model_class(args)
-    model = load_weights(args, model)
-
     if args.retrain_type in ["llr", "both"]:
         # Performs LLR.
         new_args = set_llr_args(args, "llr")
+
+        model = model_class(new_args)
+        model = load_weights(new_args, model)
         model.hparams.train_type = "llr" # Used for dumping results
+
         train_fc_only(model)
         main(new_args, model, datamodule_class, model_hooks=[reset_fc_hook])
 
     if args.retrain_type in ["dfr", "both"]:
         # Performs DFR.
         new_args = set_llr_args(args, "dfr")
+
+        model = model_class(new_args)
+        model = load_weights(new_args, model)
         model.hparams.train_type = "dfr" # Used for dumping results
+
         train_fc_only(model)
         main(new_args, model, datamodule_class, model_hooks=[reset_fc_hook])
 
