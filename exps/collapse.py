@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 # Imports Sklearn packages.
 from scipy.sparse.linalg import LinearOperator, cg
+from scipy.sparse.linalg import lsqr
 
 # Imports milkshake packages.
 from milkshake.args import add_input_args
@@ -111,44 +112,29 @@ def compute_norm_of_unfrozen_weights(model):
 
 
 def get_vectorized_features(targets, features, num_classes, num_groups):
-    """Gets vectorized features for each group, class, and training split.
-
-    Args:
-        targets: A torch.Tensor of classification targets.
-        features: A torch.Tensor of model features.
-        num_classes: The total number of classes.
-        num_groups: The total number of groups.
-
-    Returns:
-        A dictionary of vectorized features broken down by class and group.
-    """
-
-    # Splits apart targets and groups if necessary.
+    """Gets vectorized features for each group, class, and training split."""
     groups = None
     if num_groups:
         groups = targets[:, 1]
         targets = targets[:, 0]
 
-    # Vectorizes the batch features.
     batch_size = features.size(0)
     batch_vectorized_features = features.view(batch_size, -1)
 
-    # Collates class features.
     features_by_class = {}
     for j in range(num_classes):
         class_features = batch_vectorized_features[targets == j]
         if j in features_by_class:
-            features_by_class[j] = torch.concat((features_by_class[j], class_features))
+            features_by_class[j] = torch.cat((features_by_class[j], class_features), dim=0)
         else:
             features_by_class[j] = class_features
 
-    # Collates group features.
     features_by_group = {}
     if num_groups:
         for j in range(num_groups):
             group_features = batch_vectorized_features[groups == j]
             if j in features_by_group:
-                features_by_group[j] = torch.concat((features_by_group[j], group_features))
+                features_by_group[j] = torch.cat((features_by_group[j], group_features), dim=0)
             else:
                 features_by_group[j] = group_features
 
@@ -161,57 +147,56 @@ def get_vectorized_features(targets, features, num_classes, num_groups):
     return vectorized_features
 
 
-def conjugate_gradient_torch(A_func, b, x0=None, tol=1e-5, maxiter=None):
+def conjugate_gradient_torch(A_func, b, tol=1e-5, maxiter=None):
     """
-    Pure PyTorch implementation of conjugate gradient solver.
-    
-    Args:
-        A_func: Function that computes A @ x for any vector x
-        b: Right-hand side vector
-        x0: Initial guess (default: zeros)
-        tol: Convergence tolerance
-        maxiter: Maximum iterations (default: size of b)
-    
-    Returns:
-        x: Solution vector
-        info: 0 if converged, >0 indicates number of iterations at non-convergence
+    Pure PyTorch conjugate gradient solver for symmetric positive-definite linear operators.
+    A_func: function that maps vector -> vector (same shape as b)
+    b: 1-D torch tensor
     """
+    # ensure b is 1-D
+    assert b.dim() == 1, "b must be 1-D"
+    device = b.device
+    dtype = b.dtype
     n = b.shape[0]
     if maxiter is None:
         maxiter = n
-    
-    if x0 is None:
-        x = torch.zeros_like(b)
-    else:
-        x = x0.clone()
-    
+
+    x = torch.zeros_like(b, device=device, dtype=dtype)
     r = b - A_func(x)
+    if r.norm() < tol:
+        return x, 0
+
     p = r.clone()
-    rsold = torch.dot(r, r)
-    
-    for i in range(maxiter):
+    rTr = torch.dot(r, r)
+    k = 0
+
+    while k < maxiter:
         Ap = A_func(p)
-        alpha = rsold / torch.dot(p, Ap)
+        pAp = torch.dot(p, Ap)
+        if torch.abs(pAp) < 1e-30:
+            # breakdown
+            return x, k + 1
+
+        alpha = rTr / pAp
         x = x + alpha * p
         r = r - alpha * Ap
-        rsnew = torch.dot(r, r)
-        
-        if torch.sqrt(rsnew) < tol:
+
+        if r.norm() < tol:
             return x, 0
-            
-        beta = rsnew / rsold
+
+        rnewTrnew = torch.dot(r, r)
+        beta = rnewTrnew / rTr
         p = r + beta * p
-        rsold = rsnew
-    
-    return x, maxiter
+        rTr = rnewTrnew
+        k += 1
+
+    return x, maxiter  # did not converge within maxiter
 
 
 class FeatureCollapseMarginResNet(ResNet):
     def __init__(self, args):
         super().__init__(args)
         self.features = None
-        # Set this to False to use scipy CG on CPU (can be better for very large problems)
-        self.use_gpu_cg = False
         
     @torch.no_grad()
     def get_global_feature_info(self):
@@ -278,210 +263,160 @@ class FeatureCollapseMarginResNet(ResNet):
     @torch.no_grad()
     def compute_covariance_matrices(self, num_samples, global_mean, mode_means, mode=None):
         """Performs memory-efficient computation of covariance matrices for feature collapse.
-        
-        Uses stochastic trace estimation and conjugate gradient to avoid storing full matrices.
 
         Args:
             num_samples: The number of samples in the training dataset.
             global_mean: The mean of all training sample features.
-            mode_means: Either the class means or group means.
+            mode_means: Either the class means or group means (tensor of shape [M, d]).
             mode: Either "total", "class", or "group".
 
         Returns:
             Various norms and traces depending on mode.
         """
-        
         torch.cuda.empty_cache()
-        
+
         feature_dim = global_mean.shape[0]
         num_modes = mode_means.shape[0] if mode != "total" else 0
-        
-        # Helper function to apply covariance matrix-vector products
-        def apply_cov_matvec(v, centered_features_fn, num_samples_cov):
-            """Applies covariance matrix to vector v without forming the matrix."""
-            result = torch.zeros_like(v)
+        device, dtype = global_mean.device, global_mean.dtype
+
+        if mode != "total":
+            features_by_mode = "features_by_class" if mode == "class" else "features_by_group"
+
+        num_random_vecs = 1
+
+        # === Inter-covariance pseudoinverse solver (M x M trick) ===
+        # if mode != "total" and num_modes > 0:
+        #     C = (mode_means - global_mean.to(device=device, dtype=dtype))  # (M, d)
+        #     M = C.shape[0]
+
+        #     # small Gram matrix
+        #     G = (C @ C.t()) / float(M)   # (M, M)
+
+        #     # regularization relative to spectrum
+        #     eigvals = torch.linalg.eigvalsh(G)
+        #     max_eig = eigvals.max().clamp(min=0.0)
+        #     eps = max(1e-12, 1e-6 * float(max_eig))
+        #     G_reg = G + eps * torch.eye(M, device=device, dtype=dtype)
+
+        #     # factorize once
+        #     try:
+        #         L = torch.linalg.cholesky(G_reg)
+        #         def solve_G(b):
+        #             y = torch.cholesky_solve(b.unsqueeze(-1), L)  # (M,1)
+        #             return y.squeeze(-1)
+        #     except RuntimeError:
+        #         G_inv = torch.linalg.inv(G_reg)
+        #         def solve_G(b):
+        #             return G_inv @ b
+
+        #     def solve_inter_pinv(z):
+        #         # Computes x ≈ B^+ z without ever forming d x d
+        #         Cz = C @ z                     # (M,)
+        #         y = solve_G(Cz)                # (M,)
+        #         x = float(M) * (C.t() @ y)     # (d,)
+        #         return x
+        # else:
+        #     def solve_inter_pinv(z):
+        #         return torch.zeros_like(z)
             
+
+        # def solve_inter_pinv(z):
+        #     M = num_modes
+        #     C = (mode_means - global_mean.to(device=device, dtype=dtype))  # (M, d)
+        #     Cz = C @ z                                                     # (M,)
+        #     G = (C @ C.t())                                                # (M, M)
+        #     G_pinv = torch.linalg.pinv(G)
+        #     Btz = float(M) * (C.t() @ G_pinv @ Cz)
+        #     return Btz
+
+        # ---- inter-covariance: B v = (1/M) sum_c ( (mu_c - mu) ( (mu_c - mu)^T v ) )
+        def apply_inter_cov(v):
+            centered_means = mode_means - global_mean  # (M, d)
+            v_torch = torch.from_numpy(v).to(centered_means.device).to(centered_means.dtype) # (d,)
+            Cv = centered_means @ v_torch                     # (M,)
+            Bv = centered_means.t().mv(Cv)          # (d,)
+            return (Bv / float(num_modes)).cpu().numpy()
+
+
+        # === Apply intra covariance (streaming) ===
+        def apply_intra_cov(v):
+            Wv = torch.zeros((feature_dim,), device=device, dtype=dtype)
             for idx, batch in enumerate(self.trainer.train_dataloader):
-                batch[0] = batch[0].cuda()
-                batch[1] = batch[1].cuda()
-                result_batch = self.step(batch, idx)
-                
+                batch[0], batch[1] = batch[0].cuda(), batch[1].cuda()
+                result = self.step(batch, idx)
                 features = get_vectorized_features(
-                    result_batch["targets"],
-                    self.features,
-                    self.hparams.num_classes,
-                    self.hparams.num_groups,
+                    result["targets"], self.features,
+                    self.hparams.num_classes, self.hparams.num_groups,
                 )
-                
-                centered_feats = centered_features_fn(features, result_batch)
-                
-                if centered_feats.numel() > 0:  # Check if there are features
-                    # Compute (1/n) * F^T * F * v = (1/n) * F^T * (F * v)
-                    # More efficient: compute Fv first (matrix-vector), then F^T(Fv)
-                    Fv = torch.mv(centered_feats, v)  # (n_samples,)
-                    result += torch.mv(centered_feats.t(), Fv) / num_samples_cov
-                    
-            return result
-        
-        # Compute Frobenius norm using stochastic trace estimation
-        def estimate_frobenius_norm(centered_features_fn, num_samples_cov, num_random_vecs=1):
-            """Estimates Frobenius norm using Hutchinson's trace estimator."""
-            trace_estimate = 0.0
-            
-            for _ in range(num_random_vecs):
-                # Random Rademacher vector (more efficient than Gaussian for trace estimation)
-                z = torch.randint(0, 2, (feature_dim,), device='cuda', dtype=torch.float32) * 2 - 1
-                z = z / np.sqrt(num_random_vecs)
-                
-                Cz = apply_cov_matvec(z, centered_features_fn, num_samples_cov)
-                trace_estimate += torch.dot(z, Cz).item()
-                
-            return np.sqrt(max(0, trace_estimate))  # Ensure non-negative due to numerical errors
-        
+                centered_feats_list = []
+                for j in range(num_modes):
+                    if j in features[features_by_mode] and len(features[features_by_mode][j]) > 0:
+                        centered_feats_list.append(features[features_by_mode][j] - mode_means[j])
+                if len(centered_feats_list) == 0:
+                    continue
+                centered_feats = torch.cat(centered_feats_list, dim=0)  # (n_j, d)
+                Cv = centered_feats @ v                                # (n_j,)
+                Wv += centered_feats.t() @ Cv                          # (d,)
+            Wv /= num_samples
+            return Wv
+
+        # === Apply total covariance (streaming) ===
+        def apply_total_cov(v):
+            Tv = torch.zeros((feature_dim,), device=device, dtype=dtype)
+            for idx, batch in enumerate(self.trainer.train_dataloader):
+                batch[0], batch[1] = batch[0].cuda(), batch[1].cuda()
+                result = self.step(batch, idx)
+                features = get_vectorized_features(
+                    result["targets"], self.features,
+                    self.hparams.num_classes, self.hparams.num_groups,
+                )
+                centered_feats = features["features"] - global_mean
+                Cv = centered_feats @ v
+                Tv += centered_feats.t() @ Cv
+            Tv /= num_samples
+            return Tv
+
+        # === Norm/trace estimation ===
         if mode == "total":
-            def centered_features_total(features, result_batch):
-                return features["features"] - global_mean
-            
-            total_cov_norm = estimate_frobenius_norm(centered_features_total, num_samples)
-            return total_cov_norm
-            
-        elif mode == "class":
-            def centered_features_intra_class(features, result_batch):
-                class_features_list = []
-                for j in range(self.hparams.num_classes):
-                    if j in features["features_by_class"] and len(features["features_by_class"][j]) > 0:
-                        class_features_list.append(features["features_by_class"][j] - mode_means[j])
-                if class_features_list:
-                    return torch.cat(class_features_list, dim=0)
-                else:
-                    return torch.empty(0, feature_dim, device='cuda')
-            
-            # Compute intra-class covariance norm
-            intra_class_cov_norm = estimate_frobenius_norm(centered_features_intra_class, num_samples)
-            
-            # Compute inter-class covariance (low-rank, so we can compute it directly)
-            centered_class_means = mode_means - global_mean
-            # Normalize: (1/K) * M^T * M
-            inter_class_cov_norm = torch.norm(centered_class_means, p='fro') / np.sqrt(self.hparams.num_classes)
-            
-            # Function to apply inter-class covariance
-            def apply_inter_class_cov(v):
-                # (1/K) * M^T * M * v where M = centered_class_means^T
-                Mv = torch.mv(centered_class_means, v)
-                return torch.mv(centered_class_means.t(), Mv) / self.hparams.num_classes
-            
-            # Add regularization for numerical stability
-            epsilon = 1e-3
-            def apply_inter_class_cov_reg(v):
-                return apply_inter_class_cov(v) + epsilon * v
-            
-            # Compute trace(intra * pinv(inter)) using stochastic estimation
-            trace_estimate = 0.0
-            num_trace_samples = 1
-            
-            for _ in range(num_trace_samples):
-                # Random vector for trace estimation
-                z = torch.randn(feature_dim, device='cuda', dtype=torch.float32)
-                z = z / np.sqrt(num_trace_samples)
-                
-                # Apply intra-class covariance
-                intra_z = apply_cov_matvec(z, centered_features_intra_class, num_samples)
-                
-                # Solve inter_class_cov_reg * x = intra_z
-                if self.use_gpu_cg:
-                    # Pure GPU implementation
-                    x_solution, info = conjugate_gradient_torch(
-                        apply_inter_class_cov_reg, 
-                        intra_z, 
-                        tol=1e-5, 
-                        maxiter= feature_dim #min(100, feature_dim)
-                    )
-                    if info > 0:
-                        print(f"GPU CG did not converge in {info} iterations")
-                else:
-                    # CPU implementation with scipy
-                    A_op = LinearOperator(
-                        shape=(feature_dim, feature_dim),
-                        matvec=lambda x: apply_inter_class_cov_reg(
-                            torch.from_numpy(x).cuda().float()
-                        ).cpu().numpy(),
-                        dtype=np.float32
-                    )
-                    x_solution, info = cg(A_op, intra_z.cpu().numpy(), rtol=1e-5, maxiter=feature_dim)
-                    if info != 0:
-                        print(f"CPU CG did not converge: info={info}")
-                    x_solution = torch.from_numpy(x_solution).cuda().float()
-                
-                trace_estimate += torch.dot(z, x_solution).item()
-            
-            class_trace = trace_estimate / self.hparams.num_classes
-            
-            return inter_class_cov_norm.item(), intra_class_cov_norm, class_trace
-            
-        elif mode == "group":
-            def centered_features_intra_group(features, result_batch):
-                group_features_list = []
-                for j in range(self.hparams.num_groups):
-                    if j in features["features_by_group"] and len(features["features_by_group"][j]) > 0:
-                        group_features_list.append(features["features_by_group"][j] - mode_means[j])
-                if group_features_list:
-                    return torch.cat(group_features_list, dim=0)
-                else:
-                    return torch.empty(0, feature_dim, device='cuda')
-            
-            # Compute intra-group covariance norm
-            intra_group_cov_norm = estimate_frobenius_norm(centered_features_intra_group, num_samples)
-            
-            # Compute inter-group covariance
-            centered_group_means = mode_means - global_mean
-            inter_group_cov_norm = torch.norm(centered_group_means, p='fro') / np.sqrt(self.hparams.num_groups)
-            
-            # Function to apply inter-group covariance
-            def apply_inter_group_cov(v):
-                Mv = torch.mv(centered_group_means, v)
-                return torch.mv(centered_group_means.t(), Mv) / self.hparams.num_groups
-            
-            epsilon = 1e-3
-            def apply_inter_group_cov_reg(v):
-                return apply_inter_group_cov(v) + epsilon * v
-            
-            # Compute trace
-            trace_estimate = 0.0
-            num_trace_samples = 1
-            
-            for _ in range(num_trace_samples):
-                z = torch.randn(feature_dim, device='cuda', dtype=torch.float32)
-                z = z / np.sqrt(num_trace_samples)
-                
-                intra_z = apply_cov_matvec(z, centered_features_intra_group, num_samples)
-                
-                if self.use_gpu_cg:
-                    x_solution, info = conjugate_gradient_torch(
-                        apply_inter_group_cov_reg,
-                        intra_z,
-                        tol=1e-5,
-                        maxiter=feature_dim #min(100, feature_dim)
-                    )
-                    if info > 0:
-                        print(f"GPU CG did not converge in {info} iterations")
-                else:
-                    A_op = LinearOperator(
-                        shape=(feature_dim, feature_dim),
-                        matvec=lambda x: apply_inter_group_cov_reg(
-                            torch.from_numpy(x).cuda().float()
-                        ).cpu().numpy(),
-                        dtype=np.float32
-                    )
-                    x_solution, info = cg(A_op, intra_z.cpu().numpy(), rtol=1e-5, maxiter=feature_dim)
-                    if info != 0:
-                        print(f"CPU CG did not converge: info={info}")
-                    x_solution = torch.from_numpy(x_solution).cuda().float()
-                
-                trace_estimate += torch.dot(z, x_solution).item()
-            
-            group_trace = trace_estimate / self.hparams.num_groups
-            
-            return inter_group_cov_norm.item(), intra_group_cov_norm, group_trace
+            norm_estimate = 0
+            for _ in range(num_random_vecs):
+                z = torch.randint(0, 2, (feature_dim,), device=device, dtype=dtype) * 2 - 1
+                Tz = apply_total_cov(z)
+                norm_estimate += torch.dot(z, Tz)
+            norm_estimate /= num_random_vecs
+            norm_estimate = torch.sqrt(norm_estimate)
+            return norm_estimate
+        else:
+            trace_estimate, inter_norm_estimate, intra_norm_estimate = 0, 0, 0
+            for _ in range(num_random_vecs):
+                z = torch.randint(0, 2, (feature_dim,), device=device, dtype=dtype) * 2 - 1
+                # inter norm
+                x_inter = (mode_means - global_mean)  # just to reuse
+                Bz = x_inter.t() @ (x_inter @ z) / num_modes  # same as apply_inter_cov
+                inter_norm_estimate += torch.dot(Bz, Bz)
+                # intra norm
+                Wz = apply_intra_cov(z)
+                intra_norm_estimate += torch.dot(Wz, Wz)
+                # trace via pseudoinverse solve
+                z_numpy = z.cpu().numpy()
+
+                B = LinearOperator(
+                    shape=(feature_dim, feature_dim),
+                    matvec=apply_inter_cov,
+                    rmatvec=apply_inter_cov
+                )
+
+                x_numpy  = lsqr(B, z_numpy)[0]
+                x_torch = torch.from_numpy(x_numpy).float().cuda()
+                y = apply_intra_cov(x_torch)
+                trace_estimate += torch.dot(z, y)
+
+            inter_norm_estimate = torch.sqrt(inter_norm_estimate / num_random_vecs)
+            intra_norm_estimate = torch.sqrt(intra_norm_estimate / num_random_vecs)
+            trace_estimate /= num_random_vecs
+            return inter_norm_estimate, intra_norm_estimate, trace_estimate
+
+        
 
     def compute_collapse_metrics(self):
         """Performs feature collapse metrics computation.
