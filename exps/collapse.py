@@ -146,52 +146,75 @@ def get_vectorized_features(targets, features, num_classes, num_groups):
 
     return vectorized_features
 
+# @torch.no_grad()
+# def lsqr_torch(apply_A, apply_AT, b, max_iter=100, tol=1e-6, device=None, dtype=None):
+#     """
+#     Torch implementation of LSQR, working like scipy.sparse.linalg.lsqr but fully on GPU.
 
-def conjugate_gradient_torch(A_func, b, tol=1e-5, maxiter=None):
-    """
-    Pure PyTorch conjugate gradient solver for symmetric positive-definite linear operators.
-    A_func: function that maps vector -> vector (same shape as b)
-    b: 1-D torch tensor
-    """
-    # ensure b is 1-D
-    assert b.dim() == 1, "b must be 1-D"
-    device = b.device
-    dtype = b.dtype
-    n = b.shape[0]
-    if maxiter is None:
-        maxiter = n
+#     Args:
+#         apply_A  : function v -> A v  (torch vector -> torch vector)
+#         apply_AT : function v -> A^T v
+#         b        : RHS vector (torch, shape [d], on GPU)
+#         max_iter : maximum iterations
+#         tol      : stopping tolerance on residual norm
+#         device   : torch device (default = b.device)
+#         dtype    : torch dtype (default = b.dtype)
 
-    x = torch.zeros_like(b, device=device, dtype=dtype)
-    r = b - A_func(x)
-    if r.norm() < tol:
-        return x, 0
+#     Returns:
+#         x : approximate solution (torch tensor on device)
+#     """
+#     if device is None: device = b.device
+#     if dtype is None: dtype = b.dtype
 
-    p = r.clone()
-    rTr = torch.dot(r, r)
-    k = 0
+#     d = b.shape[0]
+#     x = torch.zeros(d, device=device, dtype=dtype)
 
-    while k < maxiter:
-        Ap = A_func(p)
-        pAp = torch.dot(p, Ap)
-        if torch.abs(pAp) < 1e-30:
-            # breakdown
-            return x, k + 1
+#     u = b.clone()
+#     beta = torch.norm(u)
+#     if beta == 0:
+#         return x
 
-        alpha = rTr / pAp
-        x = x + alpha * p
-        r = r - alpha * Ap
+#     u /= beta
+#     v = apply_AT(u)
+#     alpha = torch.norm(v)
+#     if alpha == 0:
+#         return x
 
-        if r.norm() < tol:
-            return x, 0
+#     v /= alpha
+#     w = v.clone()
+#     phi_bar = beta
+#     rho_bar = alpha
 
-        rnewTrnew = torch.dot(r, r)
-        beta = rnewTrnew / rTr
-        p = r + beta * p
-        rTr = rnewTrnew
-        k += 1
+#     for it in range(max_iter):
+#         # bidiagonalization step
+#         u = apply_A(v) - alpha * u
+#         beta = torch.norm(u)
+#         if beta > 0:
+#             u /= beta
+#             v = apply_AT(u) - beta * v
+#             alpha = torch.norm(v)
+#             if alpha > 0:
+#                 v /= alpha
 
-    return x, maxiter  # did not converge within maxiter
+#         # construct and apply rotation
+#         rho = torch.sqrt(rho_bar**2 + beta**2)
+#         c = rho_bar / rho
+#         s = beta / rho
+#         theta = s * alpha
+#         rho_bar = -c * alpha
+#         phi = c * phi_bar
+#         phi_bar = s * phi_bar
 
+#         # update x and w
+#         x += (phi / rho) * w
+#         w = v - (theta / rho) * w
+
+#         # stopping criterion
+#         resid = torch.abs(phi_bar)
+#         if resid < tol:
+#             break
+
+#     return x
 
 class FeatureCollapseMarginResNet(ResNet):
     def __init__(self, args):
@@ -282,60 +305,16 @@ class FeatureCollapseMarginResNet(ResNet):
         if mode != "total":
             features_by_mode = "features_by_class" if mode == "class" else "features_by_group"
 
-        num_random_vecs = 1
-
-        # === Inter-covariance pseudoinverse solver (M x M trick) ===
-        # if mode != "total" and num_modes > 0:
-        #     C = (mode_means - global_mean.to(device=device, dtype=dtype))  # (M, d)
-        #     M = C.shape[0]
-
-        #     # small Gram matrix
-        #     G = (C @ C.t()) / float(M)   # (M, M)
-
-        #     # regularization relative to spectrum
-        #     eigvals = torch.linalg.eigvalsh(G)
-        #     max_eig = eigvals.max().clamp(min=0.0)
-        #     eps = max(1e-12, 1e-6 * float(max_eig))
-        #     G_reg = G + eps * torch.eye(M, device=device, dtype=dtype)
-
-        #     # factorize once
-        #     try:
-        #         L = torch.linalg.cholesky(G_reg)
-        #         def solve_G(b):
-        #             y = torch.cholesky_solve(b.unsqueeze(-1), L)  # (M,1)
-        #             return y.squeeze(-1)
-        #     except RuntimeError:
-        #         G_inv = torch.linalg.inv(G_reg)
-        #         def solve_G(b):
-        #             return G_inv @ b
-
-        #     def solve_inter_pinv(z):
-        #         # Computes x ≈ B^+ z without ever forming d x d
-        #         Cz = C @ z                     # (M,)
-        #         y = solve_G(Cz)                # (M,)
-        #         x = float(M) * (C.t() @ y)     # (d,)
-        #         return x
-        # else:
-        #     def solve_inter_pinv(z):
-        #         return torch.zeros_like(z)
-            
-
-        # def solve_inter_pinv(z):
-        #     M = num_modes
-        #     C = (mode_means - global_mean.to(device=device, dtype=dtype))  # (M, d)
-        #     Cz = C @ z                                                     # (M,)
-        #     G = (C @ C.t())                                                # (M, M)
-        #     G_pinv = torch.linalg.pinv(G)
-        #     Btz = float(M) * (C.t() @ G_pinv @ Cz)
-        #     return Btz
+        num_random_vecs = 10
 
         # ---- inter-covariance: B v = (1/M) sum_c ( (mu_c - mu) ( (mu_c - mu)^T v ) )
         def apply_inter_cov(v):
-            centered_means = mode_means - global_mean  # (M, d)
+            centered_means = mode_means - global_mean                                        # (M, d)
             v_torch = torch.from_numpy(v).to(centered_means.device).to(centered_means.dtype) # (d,)
-            Cv = centered_means @ v_torch                     # (M,)
-            Bv = centered_means.t().mv(Cv)          # (d,)
-            return (Bv / float(num_modes)).cpu().numpy()
+            Cv = centered_means @ v_torch                                                    # (M,)
+            # Cv = centered_means @ v
+            Bv = centered_means.t().mv(Cv)                                                   # (d,)
+            return (Bv / float(num_modes)).cpu().numpy() # Bv / float(num_modes)
 
 
         # === Apply intra covariance (streaming) ===
@@ -397,6 +376,7 @@ class FeatureCollapseMarginResNet(ResNet):
                 # intra norm
                 Wz = apply_intra_cov(z)
                 intra_norm_estimate += torch.dot(Wz, Wz)
+                
                 # trace via pseudoinverse solve
                 z_numpy = z.cpu().numpy()
 
@@ -408,6 +388,8 @@ class FeatureCollapseMarginResNet(ResNet):
 
                 x_numpy  = lsqr(B, z_numpy)[0]
                 x_torch = torch.from_numpy(x_numpy).float().cuda()
+
+                # x_torch = lsqr_torch(apply_inter_cov, apply_inter_cov, z)
                 y = apply_intra_cov(x_torch)
                 trace_estimate += torch.dot(z, y)
 
