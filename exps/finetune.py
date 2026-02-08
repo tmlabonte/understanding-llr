@@ -29,6 +29,7 @@ from milkshake.main import main
 from milkshake.models.bert import BERT
 from milkshake.models.convnextv2 import ConvNeXtV2
 from milkshake.models.resnet import ResNet
+from milkshake.models.swin import Swin
 from milkshake.utils import to_np
 
 
@@ -64,6 +65,7 @@ VERSIONS = {
     "bert": ["tiny", "mini", "small", "medium", "base"],
     "convnextv2": ["atto", "femto", "pico", "nano", "tiny", "base"],
     "resnet": [18, 34, 50, 101, 152],
+    "swin": ["tiny", "small", "base", "large"],
 }
 
 class CelebARetrain(CelebA, Retrain):
@@ -230,6 +232,27 @@ class ConvNeXtV2WithLogging(ConvNeXtV2):
             weight_aa_by_proportion=self.hparams.datamodule == "waterbirds",
         )
 
+class SwinWithLogging(Swin):
+    """Quick and dirty extension of Swin with metrics exported to dict."""
+
+    def __init__(self, args, **kwargs):
+        super().__init__(args, **kwargs)
+
+    def step(self, batch, idx):
+        inputs, targets = batch
+        logits = self(inputs)
+        return step_with_upweighting(self.hparams, logits, targets)
+    
+    def validation_epoch_end(self, validation_step_outputs):
+        super().validation_epoch_end(validation_step_outputs)
+        log_results(
+            self.hparams,
+            self.current_epoch + 1,
+            self.trainer.logger.version, 
+            validation_step_outputs,
+            weight_aa_by_proportion=self.hparams.datamodule == "waterbirds",
+        )
+
 class ResNetWithLogging(ResNet):
     """Quick and dirty extension of ResNet with metrics exported to dict."""
 
@@ -300,6 +323,8 @@ def dump_results(args, curr_epoch, curr_results):
         v = args.convnextv2_version
     elif args.model == "resnet":
         v = args.resnet_version
+    elif args.model == "swin":
+        v = args.swin_version
 
     p = args.split
     c = args.balance_erm
@@ -421,8 +446,6 @@ if __name__ == "__main__":
                help="The split to train on; either the train set or the combined train and held-out set.")
     parser.add("--train_pct", default=100, type=int,
                help="The percentage of the train set to utilize (for ablations)")
-    parser.add("--num_classes", default=None, type=int,
-               help="The number of outputs produced by the model.")
 
     datamodules = {
         "celeba": CelebARetrain,
@@ -435,6 +458,7 @@ if __name__ == "__main__":
         "bert": BERTWithLogging,
         "convnextv2": ConvNeXtV2WithLogging,
         "resnet": ResNetWithLogging,
+        "swin": SwinWithLogging,
     }
 
     args = parser.parse_args()

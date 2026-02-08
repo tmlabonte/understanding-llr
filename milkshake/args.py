@@ -141,5 +141,11 @@ def add_input_args(parser):
                help="The filepath of the model checkpoint to load or resume.")
     parser.add("--weight_decay", default=1e-4, type=float,
                help="The l2-norm regularization to utilize during optimization.")
+    parser.add("--swin_pretrained", choices=["imagenet1k", "imagenet21k"], default="imagenet1k",
+               help="The pretrained weights to use in the Swin Transformer.")
+    parser.add("--swin_version", choices=["tiny", "small", "base", "large"], default="base",
+               help="The Swin Transformer version to utilize.")
+    parser.add("--swin_type", choices=["classifier", "feature_extractor"], default="classifier",
+               help="Whether to use the Swin Transformer as a classifier or feature extractor.")
 
     return parser
