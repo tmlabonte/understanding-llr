@@ -74,6 +74,11 @@ class Swin(Model):
         outputs = self.model(inputs)
 
         if self.hparams.swin_type == "classifier":
-            return outputs.logits
+            logits = outputs.logits
+            # Check if the output is a column vector [Batch, 1]
+            # and flatten it to [Batch] to align with target shape.
+            if logits.ndim == 2 and logits.size(-1) == 1:
+                return logits.squeeze(-1)
+            return logits
         else:
             return outputs.last_hidden_state
