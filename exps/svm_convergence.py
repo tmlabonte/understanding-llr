@@ -521,6 +521,9 @@ if __name__ == "__main__":
     parser = Trainer.add_argparse_args(parser)
 
     # Arguments imported from retrain.py.
+    # Extend the argument parser to include balance_erm_type
+    parser.add("--balance_erm_type", choices=["class", "group"], default="class",
+            help="Specify whether class or group balancing is used during ERM training.")
     parser.add("--balance_erm", choices=["mixture", "none", "subsetting", "upsampling", "upweighting"], default="none",
                help="Which type of class-balancing to perform during ERM training.")
     parser.add("--balance_retrain", choices=["mixture", "none", "subsetting", "upsampling", "upweighting"], default="none",
@@ -533,6 +536,8 @@ if __name__ == "__main__":
                help="The split to train on; either the train set or the combined train and held-out set.")
     parser.add("--train_pct", default=100, type=int,
                help="The percentage of the train set to utilize (for ablations)")
+    parser.add("--heldout", default=True, type=lambda x: bool(strtobool(x)),
+               help="Whether to perform LLR on a held-out set or the training set.")
 
     datamodules = {
         "celeba": CelebARetrain,

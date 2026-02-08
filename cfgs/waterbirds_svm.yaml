@@ -13,3 +13,4 @@ swin_version: tiny #resnet_version: 50
 num_sanity_val_steps: 0
 optimizer: adamw
 wandb: True
+heldout: True

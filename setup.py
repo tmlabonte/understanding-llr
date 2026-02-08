@@ -12,6 +12,6 @@ setup(
     description="Quick and extendable experimentation with classification models",
     install_requires=required,
     name="milkshake",
-    packages=["milkshake"],
+    packages=["milkshake", "exps"],
     version="1.0.0",
 )
