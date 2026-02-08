@@ -66,7 +66,106 @@ VERSIONS = {
     "bert": ["tiny", "mini", "small", "medium", "base"],
     "convnextv2": ["atto", "femto", "pico", "nano", "tiny", "base"],
     "resnet": [18, 34, 50, 101, 152],
+    "swin": ["tiny", "small", "base", "large"],
 }
+
+class SVMSwin(Swin):
+    def __init__(self, args):
+        super().__init__(args)
+        self.features = None
+        self.svm_weights_normalized = None
+        self.svm_trained = False
+
+        # Registers model hook to get Swin features.
+        def get_features():
+            def hook(module, input, output):
+                self.features = input[0].detach()  # input to the classifier
+            return hook
+
+        handle = self.model.classifier.register_forward_hook(get_features())
+    
+    @torch.no_grad()
+    def log_svm_metrics(self, dataloader_idx):
+        """Performs margin metrics computation.
+
+        Returns:
+            margin_metrics: The dictionary of margins and weight norms.
+        """
+        
+        self.eval()
+
+        # Extract the last fully connected layer weights for later comparison
+        nn_fc_weights = self.model.classifier.weight.data.clone()
+        nn_fc_bias = self.model.classifier.bias.data.clone()
+
+        nn_fc_weights_cpu = nn_fc_weights.cpu()  # First move to CPU
+        nn_fc_weights_normalized = nn_fc_weights_cpu / np.linalg.norm(nn_fc_weights_cpu)
+
+        if self.svm_trained == False:
+
+            print("Extracting Features")
+
+            features = []
+            labels = []
+
+            with torch.no_grad():
+                for batch in self.trainer.train_dataloader:
+                    data, target = batch
+                    data = data.to(self.device)
+                    output = self(data)
+
+                    features.append(self.features)
+                    labels.append(target)  
+
+            labels = torch.cat(labels, axis=0)
+            features = torch.cat(features, axis=0).squeeze()
+
+            print("Shape of Features: ", features.shape)
+            print("Shape of Labels: ", labels.shape)
+            
+            # Train your SVM
+
+            print("Fitting SVM")
+
+            svm = LinearSVC(fit_intercept=False, C=1e5)
+            features = features.cpu()
+            labels = labels.cpu()
+            svm.fit(features, labels[:, 0])
+
+            svm_weights = svm.coef_
+            svm_weights_normalized = svm_weights / np.linalg.norm(svm_weights)
+
+            self.svm_weights_normalized = svm_weights_normalized
+
+            self.svm_trained = True
+
+            print("SVM Trained")
+
+        # Similarity Metrics
+        cosine_similarity = np.dot(self.svm_weights_normalized.flatten(), nn_fc_weights_normalized.flatten())
+        directional_error = np.linalg.norm(nn_fc_weights_normalized - self.svm_weights_normalized)
+
+        svm_metrics = {
+            "cosine_similarity": cosine_similarity,
+            "directional_error": directional_error
+        }
+
+        self.log_metrics(svm_metrics, "train", dataloader_idx)
+
+    def training_epoch_end(self, training_step_outputs):
+        """Collates metrics upon completion of the training epoch.
+
+        Here, performs covariance matrix calculation for feature collapse.
+
+        Args:
+            training_step_outputs: List of dictionary outputs of self.training_step.
+        """
+
+        dataloader_idx = training_step_outputs[0]["dataloader_idx"]
+
+        self.log_svm_metrics(dataloader_idx)
+
+        self.collate_metrics(training_step_outputs, "train")
 
 class SVMResNet(ResNet):
     def __init__(self, args):
@@ -362,6 +461,8 @@ def find_erm_weights(args):
         v = args.convnextv2_version
     elif args.model == "resnet":
         v = args.resnet_version
+    elif args.model == "swin":
+        v = args.swin_version
 
     c = args.balance_erm
     d = args.balance_retrain
@@ -443,6 +544,7 @@ if __name__ == "__main__":
         "bert": SVMBERT,
         "convnextv2": ConvNeXtV2WithLogging,
         "resnet": SVMResNet,
+        "swin": SVMSwin,
     }
 
     args = parser.parse_args()
