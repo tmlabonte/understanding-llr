@@ -20,6 +20,10 @@ import torch
 from pytorch_lightning import Trainer
 import torch.nn.functional as F
 
+# Imports Sklearn packages.
+from scipy.sparse.linalg import LinearOperator, cg
+from scipy.sparse.linalg import lsqr
+
 # Imports milkshake packages.
 from milkshake.args import add_input_args
 from milkshake.datamodules.celeba import CelebA
@@ -179,6 +183,7 @@ class FeatureCollapseMarginResNet(ResNet):
         global_mean = 0
         class_means = [0] * self.hparams.num_classes
         group_means = [0] * self.hparams.num_groups
+        
         for idx, batch in enumerate(self.trainer.train_dataloader):
             batch[0] = batch[0].cuda()
             batch[1] = batch[1].cuda()
@@ -195,19 +200,29 @@ class FeatureCollapseMarginResNet(ResNet):
             global_mean += torch.sum(features["features"], dim=0)
 
             for j in range(self.hparams.num_classes):
-                num_samples_per_class[j] += sum([1 for t in result["targets"][:, 0] if t == j])
-                class_means[j] += torch.sum(features["features_by_class"][j], dim=0)
+                if j in features["features_by_class"]:
+                    num_samples_per_class[j] += len(features["features_by_class"][j])
+                    class_means[j] += torch.sum(features["features_by_class"][j], dim=0)
 
             for j in range(self.hparams.num_groups):
-                num_samples_per_group[j] += sum([1 for t in result["targets"][:, 1] if t == j])
-                group_means[j] += torch.sum(features["features_by_group"][j], dim=0)
+                if j in features["features_by_group"]:
+                    num_samples_per_group[j] += len(features["features_by_group"][j])
+                    group_means[j] += torch.sum(features["features_by_group"][j], dim=0)
 
         global_mean /= num_samples
 
         for j in range(self.hparams.num_classes):
-            class_means[j] /= num_samples_per_class[j]
+            if num_samples_per_class[j] > 0:
+                class_means[j] /= num_samples_per_class[j]
+            else:
+                class_means[j] = torch.zeros_like(global_mean)
+                
         for j in range(self.hparams.num_groups):
-            group_means[j] /= num_samples_per_group[j]
+            if num_samples_per_group[j] > 0:
+                group_means[j] /= num_samples_per_group[j]
+            else:
+                group_means[j] = torch.zeros_like(global_mean)
+                
         class_means = torch.stack(class_means)
         group_means = torch.stack(group_means)
 
@@ -215,128 +230,120 @@ class FeatureCollapseMarginResNet(ResNet):
 
     @torch.no_grad()
     def compute_covariance_matrices(self, num_samples, global_mean, mode_means, mode=None):
-        """Performs computation of covariance matrices for feature collapse.
-
-        TODO: Clean this up, is "mode" the best way or make multiple methods?
+        """Performs memory-efficient computation of covariance matrices for feature collapse.
 
         Args:
             num_samples: The number of samples in the training dataset.
             global_mean: The mean of all training sample features.
-            mode_means: Either the class means or group means.
+            mode_means: Either the class means or group means (tensor of shape [M, d]).
             mode: Either "total", "class", or "group".
 
         Returns:
-            cov_norm: The Frobenius norm of the covariance matrix.
-            trace: The trace of the inter/intra matmul (signal-to-noise ratio).
+            Various norms and traces depending on mode.
         """
+        torch.cuda.empty_cache()
 
-        torch.cuda.empty_cache()  # Good practice, but might need more aggressive memory management
+        feature_dim = global_mean.shape[0]
+        num_modes = mode_means.shape[0] if mode != "total" else 0
+        device, dtype = global_mean.device, global_mean.dtype
 
+        if mode != "total":
+            features_by_mode = "features_by_class" if mode == "class" else "features_by_group"
+
+        num_random_vecs = 10
+
+        # ---- inter-covariance: B v = (1/M) sum_c ( (mu_c - mu) ( (mu_c - mu)^T v ) )
+        def apply_inter_cov(v):
+            centered_means = mode_means - global_mean                                        # (M, d)
+            v_torch = torch.from_numpy(v).to(centered_means.device).to(centered_means.dtype) # (d,)
+            Cv = centered_means @ v_torch                                                    # (M,)
+            # Cv = centered_means @ v
+            Bv = centered_means.t().mv(Cv)                                                   # (d,)
+            return (Bv / float(num_modes)).cpu().numpy() # Bv / float(num_modes)
+
+
+        # === Apply intra covariance (streaming) ===
+        def apply_intra_cov(v):
+            Wv = torch.zeros((feature_dim,), device=device, dtype=dtype)
+            for idx, batch in enumerate(self.trainer.train_dataloader):
+                batch[0], batch[1] = batch[0].cuda(), batch[1].cuda()
+                result = self.step(batch, idx)
+                features = get_vectorized_features(
+                    result["targets"], self.features,
+                    self.hparams.num_classes, self.hparams.num_groups,
+                )
+                centered_feats_list = []
+                for j in range(num_modes):
+                    if j in features[features_by_mode] and len(features[features_by_mode][j]) > 0:
+                        centered_feats_list.append(features[features_by_mode][j] - mode_means[j])
+                if len(centered_feats_list) == 0:
+                    continue
+                centered_feats = torch.cat(centered_feats_list, dim=0)  # (n_j, d)
+                Cv = centered_feats @ v                                # (n_j,)
+                Wv += centered_feats.t() @ Cv                          # (d,)
+            Wv /= num_samples
+            return Wv
+
+        # === Apply total covariance (streaming) ===
+        def apply_total_cov(v):
+            Tv = torch.zeros((feature_dim,), device=device, dtype=dtype)
+            for idx, batch in enumerate(self.trainer.train_dataloader):
+                batch[0], batch[1] = batch[0].cuda(), batch[1].cuda()
+                result = self.step(batch, idx)
+                features = get_vectorized_features(
+                    result["targets"], self.features,
+                    self.hparams.num_classes, self.hparams.num_groups,
+                )
+                centered_feats = features["features"] - global_mean
+                Cv = centered_feats @ v
+                Tv += centered_feats.t() @ Cv
+            Tv /= num_samples
+            return Tv
+
+        # === Norm/trace estimation ===
         if mode == "total":
-            total_cov = 0
-        elif mode == "class":
-            inter_class_cov = 0
-            intra_class_cov = 0
-        elif mode == "group":
-            inter_group_cov = 0
-            intra_group_cov = 0
+            norm_estimate = 0
+            for _ in range(num_random_vecs):
+                z = torch.randint(0, 2, (feature_dim,), device=device, dtype=dtype) * 2 - 1
+                Tz = apply_total_cov(z)
+                norm_estimate += torch.dot(z, Tz)
+            norm_estimate /= num_random_vecs
+            norm_estimate = torch.sqrt(norm_estimate)
+            return norm_estimate
+        else:
+            trace_estimate, inter_norm_estimate, intra_norm_estimate = 0, 0, 0
+            for _ in range(num_random_vecs):
+                z = torch.randint(0, 2, (feature_dim,), device=device, dtype=dtype) * 2 - 1
+                # inter norm
+                x_inter = (mode_means - global_mean)  # just to reuse
+                Bz = x_inter.t() @ (x_inter @ z) / num_modes  # same as apply_inter_cov
+                inter_norm_estimate += torch.dot(Bz, Bz)
+                # intra norm
+                Wz = apply_intra_cov(z)
+                intra_norm_estimate += torch.dot(Wz, Wz)
+                
+                # trace via pseudoinverse solve
+                z_numpy = z.cpu().numpy()
 
-        for idx, batch in enumerate(self.trainer.train_dataloader):
-            batch[0] = batch[0].cuda()
-            batch[1] = batch[1].cuda()
-            result = self.step(batch, idx)
+                B = LinearOperator(
+                    shape=(feature_dim, feature_dim),
+                    matvec=apply_inter_cov,
+                    rmatvec=apply_inter_cov
+                )
 
-            # TODO: Perhaps compute only the features we need based on mode.
-            features = get_vectorized_features(
-                result["targets"],
-                self.features,
-                self.hparams.num_classes,
-                self.hparams.num_groups,
-            )
+                x_numpy  = lsqr(B, z_numpy)[0]
+                x_torch = torch.from_numpy(x_numpy).float().cuda()
 
-            if mode == "total":
-                features = features["features"] - global_mean
-                for sample_features in features:
-                    total_cov += torch.outer(sample_features, sample_features)
-            elif mode == "class":
-                class_features = []
-                for j in range(self.hparams.num_classes):
-                    class_features.append(features["features_by_class"][j] - mode_means[j])
-                class_features = torch.cat(class_features)
+                # x_torch = lsqr_torch(apply_inter_cov, apply_inter_cov, z)
+                y = apply_intra_cov(x_torch)
+                trace_estimate += torch.dot(z, y)
 
-                for sample_features in class_features:
-                    intra_class_cov += torch.outer(sample_features, sample_features)
-            elif mode == "group":
-                group_features = []
-                for j in range(self.hparams.num_groups):
-                    group_features.append(features["features_by_group"][j] - mode_means[j])
-                group_features = torch.cat(group_features)
+            inter_norm_estimate = torch.sqrt(inter_norm_estimate / num_random_vecs)
+            intra_norm_estimate = torch.sqrt(intra_norm_estimate / num_random_vecs)
+            trace_estimate /= num_random_vecs
+            return inter_norm_estimate, intra_norm_estimate, trace_estimate
 
-                for sample_features in group_features:
-                    intra_group_cov += torch.outer(sample_features, sample_features)
-
-        if mode == "total":
-            total_cov /= num_samples
-            total_cov_norm = torch.norm(total_cov, p="fro")
-            return total_cov_norm
-        elif mode == "class":
-            centered_class_means = mode_means - global_mean
-            for class_mean in centered_class_means:
-                inter_class_cov += torch.outer(class_mean, class_mean)
-
-            inter_class_cov /= self.hparams.num_classes
-            intra_class_cov /= num_samples
-
-            inter_class_cov_norm = torch.norm(inter_class_cov, p="fro")
-            intra_class_cov_norm = torch.norm(intra_class_cov, p="fro")
-
-            # Debugging the matrices
-            print("intra_class_cov shape:", intra_class_cov.shape)
-            print("inter_class_cov shape:", inter_class_cov.shape)
-            print("Any NaN in intra_class_cov:", torch.isnan(intra_class_cov).any())
-            print("Any NaN in inter_class_cov:", torch.isnan(inter_class_cov).any())
-
-            # Handle NaN values if found
-            intra_class_cov = torch.nan_to_num(intra_class_cov, nan=0.0)
-            inter_class_cov = torch.nan_to_num(inter_class_cov, nan=0.0)
-
-            # The problematic line
-            # class_trace = (intra_class_cov * torch.linalg.pinv(inter_class_cov, hermitian=True).t()).sum() / self.hparams.num_classes
-            epsilon = 1e-3  # Adjust as needed
-            inter_class_cov_reg = inter_class_cov + torch.eye(inter_class_cov.shape[0], device=inter_class_cov.device) * epsilon
-            class_trace = (intra_class_cov * torch.linalg.pinv(inter_class_cov_reg, hermitian=True).t()).sum() / self.hparams.num_classes
-            
-            return inter_class_cov_norm, intra_class_cov_norm, class_trace
-        elif mode == "group":
-            centered_group_means = mode_means - global_mean
-            for group_mean in centered_group_means:
-                inter_group_cov += torch.outer(group_mean, group_mean)
-
-            inter_group_cov /= self.hparams.num_groups
-            intra_group_cov /= num_samples
-
-            inter_group_cov_norm = torch.norm(inter_group_cov, p="fro")
-            intra_group_cov_norm = torch.norm(intra_group_cov, p="fro")
-
-            # Debugging the matrices
-            print("intra_group_cov shape:", intra_group_cov.shape)
-            print("inter_group_cov shape:", inter_group_cov.shape)
-            print("Any NaN in intra_group_cov:", torch.isnan(intra_group_cov).any())
-            print("Any NaN in inter_group_cov:", torch.isnan(inter_group_cov).any())
-
-            # Handle NaN values if found
-            intra_group_cov = torch.nan_to_num(intra_group_cov, nan=0.0)
-            inter_group_cov = torch.nan_to_num(inter_group_cov, nan=0.0)
-
-            # The problematic line
-            # group_trace = (intra_group_cov * torch.linalg.pinv(inter_group_cov, hermitian=True).t()).sum() / self.hparams.num_groups
-            epsilon = 1e-3  # Adjust as needed
-            inter_group_cov_reg = inter_group_cov + torch.eye(inter_group_cov.shape[0], device=inter_group_cov.device) * epsilon
-            group_trace = (intra_group_cov * torch.linalg.pinv(inter_group_cov_reg, hermitian=True).t()).sum() / self.hparams.num_groups
-
-
-
-            return inter_group_cov_norm, intra_group_cov_norm, group_trace
+        
 
     def compute_collapse_metrics(self):
         """Performs feature collapse metrics computation.
@@ -609,128 +616,118 @@ class FeatureCollapseMarginBERT(BERT):
 
     @torch.no_grad()
     def compute_covariance_matrices(self, num_samples, global_mean, mode_means, mode=None):
-        """Performs computation of covariance matrices for feature collapse.
-
-        TODO: Clean this up, is "mode" the best way or make multiple methods?
+        """Performs memory-efficient computation of covariance matrices for feature collapse.
 
         Args:
             num_samples: The number of samples in the training dataset.
             global_mean: The mean of all training sample features.
-            mode_means: Either the class means or group means.
+            mode_means: Either the class means or group means (tensor of shape [M, d]).
             mode: Either "total", "class", or "group".
 
         Returns:
-            cov_norm: The Frobenius norm of the covariance matrix.
-            trace: The trace of the inter/intra matmul (signal-to-noise ratio).
+            Various norms and traces depending on mode.
         """
+        torch.cuda.empty_cache()
 
-        torch.cuda.empty_cache()  # Good practice, but might need more aggressive memory management
+        feature_dim = global_mean.shape[0]
+        num_modes = mode_means.shape[0] if mode != "total" else 0
+        device, dtype = global_mean.device, global_mean.dtype
 
+        if mode != "total":
+            features_by_mode = "features_by_class" if mode == "class" else "features_by_group"
+
+        num_random_vecs = 3
+
+        # ---- inter-covariance: B v = (1/M) sum_c ( (mu_c - mu) ( (mu_c - mu)^T v ) )
+        def apply_inter_cov(v):
+            centered_means = mode_means - global_mean                                        # (M, d)
+            v_torch = torch.from_numpy(v).to(centered_means.device).to(centered_means.dtype) # (d,)
+            Cv = centered_means @ v_torch                                                    # (M,)
+            # Cv = centered_means @ v
+            Bv = centered_means.t().mv(Cv)                                                   # (d,)
+            return (Bv / float(num_modes)).cpu().numpy() # Bv / float(num_modes)
+
+
+        # === Apply intra covariance (streaming) ===
+        def apply_intra_cov(v):
+            Wv = torch.zeros((feature_dim,), device=device, dtype=dtype)
+            for idx, batch in enumerate(self.trainer.train_dataloader):
+                batch[0], batch[1] = batch[0].cuda(), batch[1].cuda()
+                result = self.step(batch, idx)
+                features = get_vectorized_features(
+                    result["targets"], self.features,
+                    self.hparams.num_classes, self.hparams.num_groups,
+                )
+                centered_feats_list = []
+                for j in range(num_modes):
+                    if j in features[features_by_mode] and len(features[features_by_mode][j]) > 0:
+                        centered_feats_list.append(features[features_by_mode][j] - mode_means[j])
+                if len(centered_feats_list) == 0:
+                    continue
+                centered_feats = torch.cat(centered_feats_list, dim=0)  # (n_j, d)
+                Cv = centered_feats @ v                                # (n_j,)
+                Wv += centered_feats.t() @ Cv                          # (d,)
+            Wv /= num_samples
+            return Wv
+
+        # === Apply total covariance (streaming) ===
+        def apply_total_cov(v):
+            Tv = torch.zeros((feature_dim,), device=device, dtype=dtype)
+            for idx, batch in enumerate(self.trainer.train_dataloader):
+                batch[0], batch[1] = batch[0].cuda(), batch[1].cuda()
+                result = self.step(batch, idx)
+                features = get_vectorized_features(
+                    result["targets"], self.features,
+                    self.hparams.num_classes, self.hparams.num_groups,
+                )
+                centered_feats = features["features"] - global_mean
+                Cv = centered_feats @ v
+                Tv += centered_feats.t() @ Cv
+            Tv /= num_samples
+            return Tv
+
+        # === Norm/trace estimation ===
         if mode == "total":
-            total_cov = 0
-        elif mode == "class":
-            inter_class_cov = 0
-            intra_class_cov = 0
-        elif mode == "group":
-            inter_group_cov = 0
-            intra_group_cov = 0
+            norm_estimate = 0
+            for _ in range(num_random_vecs):
+                z = torch.randint(0, 2, (feature_dim,), device=device, dtype=dtype) * 2 - 1
+                Tz = apply_total_cov(z)
+                norm_estimate += torch.dot(z, Tz)
+            norm_estimate /= num_random_vecs
+            norm_estimate = torch.sqrt(norm_estimate)
+            return norm_estimate
+        else:
+            trace_estimate, inter_norm_estimate, intra_norm_estimate = 0, 0, 0
+            for _ in range(num_random_vecs):
+                z = torch.randint(0, 2, (feature_dim,), device=device, dtype=dtype) * 2 - 1
+                # inter norm
+                x_inter = (mode_means - global_mean)  # just to reuse
+                Bz = x_inter.t() @ (x_inter @ z) / num_modes  # same as apply_inter_cov
+                inter_norm_estimate += torch.dot(Bz, Bz)
+                # intra norm
+                Wz = apply_intra_cov(z)
+                intra_norm_estimate += torch.dot(Wz, Wz)
+                
+                # trace via pseudoinverse solve
+                z_numpy = z.cpu().numpy()
 
-        for idx, batch in enumerate(self.trainer.train_dataloader):
-            batch[0] = batch[0].cuda()
-            batch[1] = batch[1].cuda()
-            result = self.step(batch, idx)
+                B = LinearOperator(
+                    shape=(feature_dim, feature_dim),
+                    matvec=apply_inter_cov,
+                    rmatvec=apply_inter_cov
+                )
 
-            # TODO: Perhaps compute only the features we need based on mode.
-            features = get_vectorized_features(
-                result["targets"],
-                self.features,
-                self.hparams.num_classes,
-                self.hparams.num_groups,
-            )
+                x_numpy  = lsqr(B, z_numpy)[0]
+                x_torch = torch.from_numpy(x_numpy).float().cuda()
 
-            if mode == "total":
-                features = features["features"] - global_mean
-                for sample_features in features:
-                    total_cov += torch.outer(sample_features, sample_features)
-            elif mode == "class":
-                class_features = []
-                for j in range(self.hparams.num_classes):
-                    class_features.append(features["features_by_class"][j] - mode_means[j])
-                class_features = torch.cat(class_features)
+                # x_torch = lsqr_torch(apply_inter_cov, apply_inter_cov, z)
+                y = apply_intra_cov(x_torch)
+                trace_estimate += torch.dot(z, y)
 
-                for sample_features in class_features:
-                    intra_class_cov += torch.outer(sample_features, sample_features)
-            elif mode == "group":
-                group_features = []
-                for j in range(self.hparams.num_groups):
-                    group_features.append(features["features_by_group"][j] - mode_means[j])
-                group_features = torch.cat(group_features)
-
-                for sample_features in group_features:
-                    intra_group_cov += torch.outer(sample_features, sample_features)
-
-        if mode == "total":
-            total_cov /= num_samples
-            total_cov_norm = torch.norm(total_cov, p="fro")
-            return total_cov_norm
-        elif mode == "class":
-            centered_class_means = mode_means - global_mean
-            for class_mean in centered_class_means:
-                inter_class_cov += torch.outer(class_mean, class_mean)
-
-            inter_class_cov /= self.hparams.num_classes
-            intra_class_cov /= num_samples
-
-            inter_class_cov_norm = torch.norm(inter_class_cov, p="fro")
-            intra_class_cov_norm = torch.norm(intra_class_cov, p="fro")
-
-            # Debugging the matrices
-            print("intra_class_cov shape:", intra_class_cov.shape)
-            print("inter_class_cov shape:", inter_class_cov.shape)
-            print("Any NaN in intra_class_cov:", torch.isnan(intra_class_cov).any())
-            print("Any NaN in inter_class_cov:", torch.isnan(inter_class_cov).any())
-
-            # Handle NaN values if found
-            intra_class_cov = torch.nan_to_num(intra_class_cov, nan=0.0)
-            inter_class_cov = torch.nan_to_num(inter_class_cov, nan=0.0)
-
-            # The problematic line
-            # class_trace = (intra_class_cov * torch.linalg.pinv(inter_class_cov, hermitian=True).t()).sum() / self.hparams.num_classes
-            epsilon = 1e-3  # Adjust as needed
-            inter_class_cov_reg = inter_class_cov + torch.eye(inter_class_cov.shape[0], device=inter_class_cov.device) * epsilon
-            class_trace = (intra_class_cov * torch.linalg.pinv(inter_class_cov_reg, hermitian=True).t()).sum() / self.hparams.num_classes
-            
-            return inter_class_cov_norm, intra_class_cov_norm, class_trace
-        elif mode == "group":
-            centered_group_means = mode_means - global_mean
-            for group_mean in centered_group_means:
-                inter_group_cov += torch.outer(group_mean, group_mean)
-
-            inter_group_cov /= self.hparams.num_groups
-            intra_group_cov /= num_samples
-
-            inter_group_cov_norm = torch.norm(inter_group_cov, p="fro")
-            intra_group_cov_norm = torch.norm(intra_group_cov, p="fro")
-
-            # Debugging the matrices
-            print("intra_group_cov shape:", intra_group_cov.shape)
-            print("inter_group_cov shape:", inter_group_cov.shape)
-            print("Any NaN in intra_group_cov:", torch.isnan(intra_group_cov).any())
-            print("Any NaN in inter_group_cov:", torch.isnan(inter_group_cov).any())
-
-            # Handle NaN values if found
-            intra_group_cov = torch.nan_to_num(intra_group_cov, nan=0.0)
-            inter_group_cov = torch.nan_to_num(inter_group_cov, nan=0.0)
-
-            # The problematic line
-            # group_trace = (intra_group_cov * torch.linalg.pinv(inter_group_cov, hermitian=True).t()).sum() / self.hparams.num_groups
-            epsilon = 1e-3  # Adjust as needed
-            inter_group_cov_reg = inter_group_cov + torch.eye(inter_group_cov.shape[0], device=inter_group_cov.device) * epsilon
-            group_trace = (intra_group_cov * torch.linalg.pinv(inter_group_cov_reg, hermitian=True).t()).sum() / self.hparams.num_groups
-
-
-
-            return inter_group_cov_norm, intra_group_cov_norm, group_trace
+            inter_norm_estimate = torch.sqrt(inter_norm_estimate / num_random_vecs)
+            intra_norm_estimate = torch.sqrt(intra_norm_estimate / num_random_vecs)
+            trace_estimate /= num_random_vecs
+            return inter_norm_estimate, intra_norm_estimate, trace_estimate
 
     def compute_collapse_metrics(self):
         """Performs feature collapse metrics computation.
@@ -1190,7 +1187,8 @@ def experiment(args, model_class, datamodule_class):
     datamodule = datamodule_class(args)
     datamodule.setup()
 
-    args.num_classes = datamodule.num_classes
+    if args.num_classes == None:
+        args.num_classes = datamodule.num_classes
     args.num_groups = datamodule.num_groups
 
     # Performs LLR.
@@ -1240,5 +1238,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     args.train_type = "erm"
-    args.results_pkl = f"{args.datamodule}_{args.model}_collapse_margin_short.pkl"
+    args.results_pkl = f"{args.datamodule}_{args.model}_collapse_heldout.pkl"
     experiment(args, models[args.model], datamodules[args.datamodule])
