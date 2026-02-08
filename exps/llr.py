@@ -12,6 +12,7 @@ import pickle
 
 # Imports Python packages.
 from configargparse import Parser
+from distutils.util import strtobool
 import numpy as np
 
 # Imports PyTorch packages.
@@ -103,15 +104,13 @@ def find_erm_weights(args):
     elif args.model == "resnet":
         v = args.resnet_version
 
+    p = args.split
     c = args.balance_erm
-    d = args.balance_retrain
     if "mixture" in c:
         c += str(args.mixture_ratio)
-    if "mixture" in d:
-        d += str(args.mixture_ratio)
     e = args.max_epochs
 
-    wandb_version = results[s][v][c]["erm"][e]["version"]
+    wandb_version = results[s][v][p][c]["erm"][e]["version"]
     if not wandb_version:
         raise ValueError(f"Model version {wandb_version} not found.")
 
@@ -125,6 +124,20 @@ def experiment(args, model_class, datamodule_class):
     """Runs main training and evaluation procedure."""
 
     args.no_test = True
+
+    # Sets weights for class-balanced upweighting.
+    args.class_weights = None
+    args.group_weights = None
+    if args.balance_retrain == "upweighting":
+        if args.datamodule == "celeba":
+            args.class_weights = [1, 5.71]
+        elif args.datamodule == "civilcomments":
+            args.class_weights = [1, 7.85]
+        elif args.datamodule == "multinli":
+            args.class_weights = [1, 1, 1]
+        elif args.datamodule == "waterbirds":
+            args.class_weights = [1, 3.31]
+                
     find_erm_weights(args)
     
     datamodule = datamodule_class(args)
@@ -133,24 +146,27 @@ def experiment(args, model_class, datamodule_class):
     args.num_classes = datamodule.num_classes
     args.num_groups = datamodule.num_groups
 
-    model = model_class(args)
-    model = load_weights(args, model)
+    if args.retrain_type in ["llr", "both"]:
+        # Performs LLR.
+        new_args = set_llr_args(args, "llr")
 
-    # Performs LLR.
-    new_args = set_llr_args(args, "llr")
-    model.hparams.train_type = "llr" # Used for dumping results
-    train_fc_only(model)
-    model, _, _ = main(
-        new_args, model, datamodule_class, model_hooks=[reset_fc_hook])
+        model = model_class(new_args)
+        model = load_weights(new_args, model)
+        model.hparams.train_type = "llr" # Used for dumping results
 
-    """
-    # Performs DFR.
-    new_args = set_llr_args(args, "dfr")
-    model.hparams.train_type = "dfr" # Used for dumping results
-    train_fc_only(model)
-    model, _, _ = main(
-        new_args, model, datamodule_class, model_hooks=[reset_fc_hook])
-    """
+        train_fc_only(model)
+        main(new_args, model, datamodule_class, model_hooks=[reset_fc_hook])
+
+    if args.retrain_type in ["dfr", "both"]:
+        # Performs DFR.
+        new_args = set_llr_args(args, "dfr")
+
+        model = model_class(new_args)
+        model = load_weights(new_args, model)
+        model.hparams.train_type = "dfr" # Used for dumping results
+
+        train_fc_only(model)
+        main(new_args, model, datamodule_class, model_hooks=[reset_fc_hook])
 
 if __name__ == "__main__":
     parser = Parser(
@@ -162,10 +178,14 @@ if __name__ == "__main__":
     parser = Trainer.add_argparse_args(parser)
 
     # Arguments imported from retrain.py.
+    parser.add("--balance_erm_type", choices=["class", "group"], default="class",
+            help="Specify whether class or group balancing is used during ERM training.")
     parser.add("--balance_erm", choices=["mixture", "none", "subsetting", "upsampling", "upweighting"], default="none",
                help="Which type of class-balancing to perform during ERM training.")
     parser.add("--balance_retrain", choices=["mixture", "none", "subsetting", "upsampling", "upweighting"], default="none",
                help="Which type of class-balancing to perform during retraining.")
+    parser.add("--heldout", default=True, type=lambda x: bool(strtobool(x)),
+               help="Whether to perform LLR on a held-out set or the training set.")
     parser.add("--mixture_ratio", type=float, default=1,
                help="The largest acceptable class imbalance ratio for the mixture balancing strategy.")
     parser.add("--save_retrained_model", action="store_true",
@@ -174,6 +194,9 @@ if __name__ == "__main__":
                help="The split to train on; either the train set or the combined train and held-out set.")
     parser.add("--train_pct", default=100, type=int,
                help="The percentage of the train set to utilize (for ablations)")
+
+    parser.add("--retrain_type", choices=["llr", "dfr", "both"], default="both",
+               help="Whether to perform LLR, DFR, or both.")
 
     datamodules = {
         "celeba": CelebARetrain,

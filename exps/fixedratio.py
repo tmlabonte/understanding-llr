@@ -74,6 +74,11 @@ class GroupRatio(Retrain):
                 minority_pct,
             ]
             print(weights_by_group)
+
+        elif self.orig_datamodule == "waterbirds":
+            weights_by_group = [0.35, 0.25, 0.25, 0.15]
+
+        """
         elif self.orig_datamodule == "waterbirds":
             # Ex. group_ratio 0.5 => group weights [0.333, 0.167, 0.167, 0.333]
             weights_by_group = [
@@ -83,6 +88,8 @@ class GroupRatio(Retrain):
                 1 - minority_pct,
             ]
             print(weights_by_group)
+        """
+        
         elif self.orig_datamodule == "civilcomments":
             # Ex. group_ratio 50 => group weights [0.333, 0.167, 0.167, 0.333]
             weights_by_group = [
@@ -137,12 +144,22 @@ class GroupRatio(Retrain):
                 class_totals[1] - class_totals[1] * minority_pct,
                 class_totals[1] * minority_pct,
             ]
+        """
         if self.orig_datamodule == "waterbirds":
             nums = [
                 class_totals[0] - class_totals[0] * minority_pct,
                 class_totals[0] * minority_pct,
                 class_totals[1] * minority_pct,
                 class_totals[1] - class_totals[1] * minority_pct
+            ]
+        """
+        if self.orig_datamodule == "waterbirds":
+            total = class_totals[0] + class_totals[1]
+            nums = [
+                int(0.35 * total),  # Group 0
+                int(0.25 * total),  # Group 1
+                int(0.25 * total),  # Group 2
+                int(0.15 * total),  # Group 3
             ]
 
         if self.orig_datamodule == "civilcomments":
@@ -425,11 +442,11 @@ def experiment(args, model_class, datamodule_class):
         args.num_classes = datamodule.num_classes
         args.num_groups = datamodule.num_groups
 
+        model = model_class(args)
+        model = load_weights(args, model)
+
         # Performs LLR.
         new_args = set_llr_args(args, "llr")
-        model = model_class(new_args)
-        model = load_weights(new_args, model)
-        
         train_fc_only(model)
         model, _, _ = main(
             new_args, model, datamodule_class, model_hooks=[reset_fc_hook])

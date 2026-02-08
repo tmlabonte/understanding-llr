@@ -22,6 +22,7 @@ class Retrain(DataModule):
 
         self.balance_erm = args.balance_erm
         self.balance_retrain = args.balance_retrain
+        self.heldout = args.heldout
         self.mixture_ratio = args.mixture_ratio
         self.retrain_type = args.retrain_type if hasattr(args, "retrain_type") else "erm"
         self.split = args.split
@@ -142,24 +143,40 @@ class Retrain(DataModule):
         retrain_num = int(self.heldout_pct * len(val_inds))
         new_val_inds = val_inds[retrain_num:]
 
-        if self.split == "train" and self.train_pct == 100:
-            new_train_inds = train_inds
-            new_retrain_inds = val_inds[:retrain_num]
-        elif self.split == "train":
-            default_rng(seed=self.seed).shuffle(train_inds)
-            train_num = int(len(train_inds) * self.train_pct / 100)
-            new_train_inds = train_inds[:train_num]
-            new_retrain_inds = train_inds[train_num:]
-        elif self.split == "combined":
-            combined_inds = np.concatenate((train_inds, val_inds))
-            train_num = int((len(train_inds) + retrain_num) * self.train_pct / 100)
-            new_retrain_num = len(combined_inds) - \
-                    int((1 - self.heldout_pct) * len(val_inds))
-            new_combined_inds = combined_inds[:new_retrain_num]
-
-            default_rng(seed=self.seed).shuffle(new_combined_inds)
-            new_train_inds = new_combined_inds[:train_num]
-            new_retrain_inds = new_combined_inds[train_num:]
+        if self.heldout:
+            # Performs LLR on a subset of the validation/held-out set.
+            if self.split == "train" and self.train_pct == 100:
+                new_train_inds = train_inds
+                new_retrain_inds = val_inds[:retrain_num]
+            elif self.split == "train":
+                default_rng(seed=self.seed).shuffle(train_inds)
+                train_num = int(len(train_inds) * self.train_pct / 100)
+                new_train_inds = train_inds[:train_num]
+                new_retrain_inds = train_inds[train_num:]
+            elif self.split == "combined":
+                combined_inds = np.concatenate((train_inds, val_inds))
+                train_num = int((len(train_inds) + retrain_num) * self.train_pct / 100)
+                new_retrain_num = len(combined_inds) - \
+                        int((1 - self.heldout_pct) * len(val_inds))
+                new_combined_inds = combined_inds[:new_retrain_num]
+    
+                default_rng(seed=self.seed).shuffle(new_combined_inds)
+                new_train_inds = new_combined_inds[:train_num]
+                new_retrain_inds = new_combined_inds[train_num:]
+        else:
+            # Performs LLR on a subset of the training set.
+            # Keeps data quantity constant for comparison with held-out LLR.
+            if self.split == "train" and self.train_pct == 100:
+                default_rng(seed=self.seed).shuffle(train_inds)
+                new_train_inds = train_inds
+                new_retrain_inds = train_inds[:retrain_num]
+            elif self.split == "train":
+                default_rng(seed=self.seed).shuffle(train_inds)
+                train_num = int(len(train_inds) * self.train_pct / 100)
+                new_train_inds = train_inds[:train_num]
+                new_retrain_inds = train_inds[:retrain_num]
+            elif self.split == "combined":
+                raise NotImplementedError()
 
         dataset_train = Subset(dataset_train, new_train_inds)
         dataset_retrain = Subset(dataset_val, new_retrain_inds)
@@ -214,9 +231,10 @@ class Retrain(DataModule):
         """Returns a group-balanced DataLoader."""
 
         if balance == "upsampling":
+            indices = self.dataset_train.train_indices
+            groups = self._make_groups_array(indices)
             counts = np.bincount(groups)
             label_weights = 1. / counts
-            groups = self._make_groups_array(indices)
             weights = label_weights[groups]
             sampler = WeightedRandomSampler(weights, len(weights))
             return self._data_loader(self.dataset_train, sampler=sampler)
@@ -229,6 +247,8 @@ class Retrain(DataModule):
             self.dataset_train = self.make_balanced_subset(
                 self.dataset_train, class_or_group="group")
             self.balanced_sampler = True
+            return super().train_dataloader()
+        elif balance == "upweighting":
             return super().train_dataloader()
         else:
             raise ValueError("Must set balance for group-balanced training.")
@@ -252,8 +272,11 @@ class Retrain(DataModule):
             return self.group_unbalanced_dataloader(self.balance_retrain)
         elif self.retrain_type == "group-balanced retraining":
             return self.group_balanced_dataloader(self.balance_retrain)
-        else: # For ERM training.
-            return self.group_unbalanced_dataloader(self.balance_erm)
+        else:  # For ERM training.
+            if self.balance_erm_type == "class":
+                return self.group_unbalanced_dataloader(self.balance_erm)
+            elif self.balance_erm_type == "group":
+                return self.group_balanced_dataloader(self.balance_erm)
 
     def val_dataloader(self):
         """Returns validation DataLoaders including train/test set.
@@ -299,3 +322,27 @@ class Retrain(DataModule):
         self._initialize_datasets_no_aug(dataset_val)
         
         print(self.load_msg())
+
+    def _make_balanced_subset_helper(
+        self,
+        indices,
+        targets_or_groups,
+        min_count,
+        len_targets_or_groups,
+    ):
+        """Makes a subset of indices which is balanced across classes/groups."""
+        
+        subset = []
+        counts = [0] * len_targets_or_groups
+        for idx, target_or_group in zip(indices, targets_or_groups):
+            if counts[target_or_group] < min_count:
+                subset.append(idx)
+                counts[target_or_group] += 1
+        
+        # Print detailed selection information
+        seed_info = f" (Seed: {self.seed})" if hasattr(self, "seed") else ""
+        print(f"Balanced subset selection{seed_info}:")
+        for group_idx, count in enumerate(counts):
+            print(f"  - Group {group_idx}: {count} samples selected")
+
+        return subset
