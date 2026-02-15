@@ -1,4 +1,4 @@
-"""Main file for ERM neural collapse."""
+"""Main file for LLR neural collapse."""
 
 # Ignores nuisance warnings. Must be called first.
 from milkshake.utils import ignore_warnings
@@ -33,6 +33,7 @@ from milkshake.datamodules.retrain import Retrain
 from milkshake.datamodules.waterbirds import Waterbirds
 from milkshake.main import main, load_weights
 from milkshake.models.bert import BERT
+from milkshake.models.swin import Swin
 from milkshake.models.convnextv2 import ConvNeXtV2
 from milkshake.models.resnet import ResNet
 from milkshake.imports import valid_models_and_datamodules
@@ -75,6 +76,7 @@ VERSIONS = {
     "bert": ["tiny", "mini", "small", "medium", "base"],
     "convnextv2": ["atto", "femto", "pico", "nano", "tiny", "base"],
     "resnet": [18, 34, 50, 101, 152],
+    "swin": ["tiny", "small", "base", "large"],
 }
 
 class CelebARetrain(CelebA, Retrain):
@@ -942,6 +944,437 @@ class FeatureCollapseMarginBERT(BERT):
 
         dump_results(args, self.current_epoch + 1, collapse_metrics)
 
+class FeatureCollapseMarginSwin(Swin):
+    def __init__(self, args):
+        super().__init__(args)
+        self.features = None
+        
+    @torch.no_grad()
+    def get_global_feature_info(self):
+        """Gets number of samples and feature means.
+
+        Returns:
+            num_samples: The number of samples in the training dataset.
+            global_mean: The mean of all training sample features.
+            class_means: The means of the features of each class.
+            group_means: The means of the features of each group.
+        """
+
+        num_samples = 0
+        num_samples_per_class = [0] * self.hparams.num_classes
+        num_samples_per_group = [0] * self.hparams.num_groups
+        global_mean = 0
+        class_means = [0] * self.hparams.num_classes
+        group_means = [0] * self.hparams.num_groups
+        
+        for idx, batch in enumerate(self.trainer.train_dataloader):
+            batch[0] = batch[0].cuda()
+            batch[1] = batch[1].cuda()
+            result = self.step(batch, idx)
+
+            features = get_vectorized_features(
+                result["targets"],
+                self.features,
+                self.hparams.num_classes,
+                self.hparams.num_groups,
+            )
+
+            num_samples += len(batch[0])
+            global_mean += torch.sum(features["features"], dim=0)
+
+            for j in range(self.hparams.num_classes):
+                if j in features["features_by_class"]:
+                    num_samples_per_class[j] += len(features["features_by_class"][j])
+                    class_means[j] += torch.sum(features["features_by_class"][j], dim=0)
+
+            for j in range(self.hparams.num_groups):
+                if j in features["features_by_group"]:
+                    num_samples_per_group[j] += len(features["features_by_group"][j])
+                    group_means[j] += torch.sum(features["features_by_group"][j], dim=0)
+
+        global_mean /= num_samples
+
+        for j in range(self.hparams.num_classes):
+            if num_samples_per_class[j] > 0:
+                class_means[j] /= num_samples_per_class[j]
+            else:
+                class_means[j] = torch.zeros_like(global_mean)
+                
+        for j in range(self.hparams.num_groups):
+            if num_samples_per_group[j] > 0:
+                group_means[j] /= num_samples_per_group[j]
+            else:
+                group_means[j] = torch.zeros_like(global_mean)
+                
+        class_means = torch.stack(class_means)
+        group_means = torch.stack(group_means)
+
+        return num_samples, global_mean, class_means, group_means
+
+    @torch.no_grad()
+    def compute_covariance_matrices(self, num_samples, global_mean, mode_means, mode=None):
+        """Performs memory-efficient computation of covariance matrices for feature collapse.
+
+        Args:
+            num_samples: The number of samples in the training dataset.
+            global_mean: The mean of all training sample features.
+            mode_means: Either the class means or group means (tensor of shape [M, d]).
+            mode: Either "total", "class", or "group".
+
+        Returns:
+            Various norms and traces depending on mode.
+        """
+        torch.cuda.empty_cache()
+
+        feature_dim = global_mean.shape[0]
+        num_modes = mode_means.shape[0] if mode != "total" else 0
+        device, dtype = global_mean.device, global_mean.dtype
+
+        if mode != "total":
+            features_by_mode = "features_by_class" if mode == "class" else "features_by_group"
+
+        num_random_vecs = 3
+
+        # ---- inter-covariance: B v = (1/M) sum_c ( (mu_c - mu) ( (mu_c - mu)^T v ) )
+        def apply_inter_cov(v):
+            centered_means = mode_means - global_mean                                        # (M, d)
+            v_torch = torch.from_numpy(v).to(centered_means.device).to(centered_means.dtype) # (d,)
+            Cv = centered_means @ v_torch                                                    # (M,)
+            # Cv = centered_means @ v
+            Bv = centered_means.t().mv(Cv)                                                   # (d,)
+            return (Bv / float(num_modes)).cpu().numpy() # Bv / float(num_modes)
+
+
+        # === Apply intra covariance (streaming) ===
+        def apply_intra_cov(v):
+            Wv = torch.zeros((feature_dim,), device=device, dtype=dtype)
+            for idx, batch in enumerate(self.trainer.train_dataloader):
+                batch[0], batch[1] = batch[0].cuda(), batch[1].cuda()
+                result = self.step(batch, idx)
+                features = get_vectorized_features(
+                    result["targets"], self.features,
+                    self.hparams.num_classes, self.hparams.num_groups,
+                )
+                centered_feats_list = []
+                for j in range(num_modes):
+                    if j in features[features_by_mode] and len(features[features_by_mode][j]) > 0:
+                        centered_feats_list.append(features[features_by_mode][j] - mode_means[j])
+                if len(centered_feats_list) == 0:
+                    continue
+                centered_feats = torch.cat(centered_feats_list, dim=0)  # (n_j, d)
+                Cv = centered_feats @ v                                # (n_j,)
+                Wv += centered_feats.t() @ Cv                          # (d,)
+            Wv /= num_samples
+            return Wv
+
+        # === Apply total covariance (streaming) ===
+        def apply_total_cov(v):
+            Tv = torch.zeros((feature_dim,), device=device, dtype=dtype)
+            for idx, batch in enumerate(self.trainer.train_dataloader):
+                batch[0], batch[1] = batch[0].cuda(), batch[1].cuda()
+                result = self.step(batch, idx)
+                features = get_vectorized_features(
+                    result["targets"], self.features,
+                    self.hparams.num_classes, self.hparams.num_groups,
+                )
+                centered_feats = features["features"] - global_mean
+                Cv = centered_feats @ v
+                Tv += centered_feats.t() @ Cv
+            Tv /= num_samples
+            return Tv
+
+        # === Norm/trace estimation ===
+        if mode == "total":
+            norm_estimate = 0
+            for _ in range(num_random_vecs):
+                z = torch.randint(0, 2, (feature_dim,), device=device, dtype=dtype) * 2 - 1
+                Tz = apply_total_cov(z)
+                norm_estimate += torch.dot(z, Tz)
+            norm_estimate /= num_random_vecs
+            norm_estimate = torch.sqrt(norm_estimate)
+            return norm_estimate
+        else:
+            trace_estimate, inter_norm_estimate, intra_norm_estimate = 0, 0, 0
+            for _ in range(num_random_vecs):
+                z = torch.randint(0, 2, (feature_dim,), device=device, dtype=dtype) * 2 - 1
+                # inter norm
+                x_inter = (mode_means - global_mean)  # just to reuse
+                Bz = x_inter.t() @ (x_inter @ z) / num_modes  # same as apply_inter_cov
+                inter_norm_estimate += torch.dot(Bz, Bz)
+                # intra norm
+                Wz = apply_intra_cov(z)
+                intra_norm_estimate += torch.dot(Wz, Wz)
+                
+                # trace via pseudoinverse solve
+                z_numpy = z.cpu().numpy()
+
+                B = LinearOperator(
+                    shape=(feature_dim, feature_dim),
+                    matvec=apply_inter_cov,
+                    rmatvec=apply_inter_cov
+                )
+
+                x_numpy  = lsqr(B, z_numpy)[0]
+                x_torch = torch.from_numpy(x_numpy).float().cuda()
+
+                # x_torch = lsqr_torch(apply_inter_cov, apply_inter_cov, z)
+                y = apply_intra_cov(x_torch)
+                trace_estimate += torch.dot(z, y)
+
+            inter_norm_estimate = torch.sqrt(inter_norm_estimate / num_random_vecs)
+            intra_norm_estimate = torch.sqrt(intra_norm_estimate / num_random_vecs)
+            trace_estimate /= num_random_vecs
+            return inter_norm_estimate, intra_norm_estimate, trace_estimate
+
+        
+
+    def compute_collapse_metrics(self):
+        """Performs feature collapse metrics computation.
+
+        Returns:
+            collapse_metrics: The dictionary of matrix norms for collapse.
+        """
+
+        # Registers model hook to get Swin features.
+        def get_features():
+            def hook(model, input, output):
+                self.features = output[0].detach()
+            return hook
+        handle = self.model.swin.encoder.layers[-1].blocks[-1].register_forward_hook(get_features())
+
+
+        if not hasattr(self.trainer, 'train_dataloader') or self.trainer.train_dataloader is None:
+            # Get dataloader directly from datamodule for eval-only mode
+            dataloader = self.trainer.datamodule.train_dataloader()
+            # Temporary assign it to make rest of the code work
+            self.trainer.train_dataloader = dataloader
+
+        # Run 4 separate epoch inferences and compute collapse metrics.
+        # If there is enough VRAM, we can combine the separate inferences.
+        num_samples, global_mean, class_means, group_means = self.get_global_feature_info()
+        total_cov = self.compute_covariance_matrices(num_samples, global_mean, None, mode="total")
+        inter_class_cov, intra_class_cov, class_trace = self.compute_covariance_matrices(num_samples, global_mean, class_means, mode="class")
+        #inter_class_cov, intra_class_cov = self.compute_covariance_matrices(num_samples, global_mean, class_means, mode="class")
+        inter_group_cov, intra_group_cov, group_trace = self.compute_covariance_matrices(num_samples, global_mean, group_means, mode="group")
+        #inter_group_cov, intra_group_cov = self.compute_covariance_matrices(num_samples, global_mean, group_means, mode="group")
+
+        # De-registers model feature hook.
+        handle.remove()
+
+        collapse_metrics = {
+            "global_cov": total_cov,
+            "inter_class_cov": inter_class_cov,
+            "intra_class_cov": intra_class_cov,
+            "inter_group_cov": inter_group_cov,
+            "intra_group_cov": intra_group_cov,
+            "class_trace": class_trace,
+            "group_trace": group_trace,
+        }
+
+        return collapse_metrics
+    
+    @torch.no_grad()
+    def log_margin_metrics(self, dataloader_idx):
+        """Performs margin metrics computation.
+
+        Returns:
+            margin_metrics: The dictionary of margins and weight norms.
+        """
+        
+        self.eval()
+
+        # Compute the L2 norm of the network weights 
+        weight_norm = compute_norm_of_unfrozen_weights(self)
+
+        # Initialize lists to store correct class scores and maximum incorrect class scores
+        correct_class_scores_list = []
+        max_incorrect_class_scores_list = []
+        group_labels = []
+
+        with torch.no_grad():
+            for idx, batch in enumerate(self.trainer.train_dataloader):
+                data = batch[0].cuda()
+                labels = batch[1].cuda()
+
+                group_labels_batch = labels[:, 1].tolist()
+                group_labels.extend(group_labels_batch)
+
+                # Forward pass
+                output_scores = self(data)
+
+                # Computes loss and prediction probabilities.
+                if self.hparams.num_classes == 1:
+                    output_scores = torch.sigmoid(output_scores)
+                else:
+                    output_scores = F.softmax(output_scores, dim=1)                
+
+                # Iterate through examples in the batch
+                for i in range(len(labels)):
+                    class_label = labels[i, 0]
+
+                    # Extract scores for the correct class
+                    correct_class_score = output_scores[i, class_label]
+
+                    # Extract scores for all other classes
+                    incorrect_class_scores = output_scores[i][labels[i, 0] != torch.arange(output_scores.size(1)).cuda()]
+
+                    # Calculate the maximum incorrect class score
+                    max_incorrect_class_score = torch.max(incorrect_class_scores)
+
+                    # Store correct and incorrect class scores
+                    correct_class_scores_list.append(correct_class_score.item())
+                    max_incorrect_class_scores_list.append(max_incorrect_class_score.item())
+
+        # Convert lists to tensors
+        correct_class_scores_tensor = torch.tensor(correct_class_scores_list)
+        max_incorrect_class_scores_tensor = torch.tensor(max_incorrect_class_scores_list)
+        group_labels = torch.tensor(group_labels)
+
+        # Get unique group labels
+        unique_groups = torch.unique(group_labels)
+
+        # Calculate margins for each point
+        margins = correct_class_scores_tensor - max_incorrect_class_scores_tensor
+        normalized_margins = margins / weight_norm
+
+        # Create a mask for the positive margins
+        positive_margin_mask = normalized_margins > 0
+        positive_margins = normalized_margins[positive_margin_mask]
+
+        # Calculates max, min, average, and per group margins.
+        if positive_margins.numel() > 0:
+            min_margin = torch.min(positive_margins)
+        else:
+            min_margin = 0
+        max_margin = torch.max(normalized_margins)
+        avg_margin = torch.sum(normalized_margins) / len(normalized_margins)
+
+        margin_metrics = {
+            "max_margin": max_margin,
+            "min_margin": min_margin,
+            "avg_margin": avg_margin,
+            "weight_norm": weight_norm
+        }
+
+        self.log_metrics(margin_metrics, "train", dataloader_idx)
+
+        if "min_margin_by_group" in self.hparams.metrics or\
+            "max_margin_by_group" in self.hparams.metrics or\
+            "avg_margin_by_group" in self.hparams.metrics:
+
+            names = []
+            values = []
+
+            min_margins_by_group = []
+            max_margins_by_group = []
+            avg_margins_by_group = []
+
+            # Iterate over unique group labels
+            for group_label in unique_groups:
+                # Mask to filter margins for the current group
+                mask = (group_labels == group_label)
+                
+                # Filter margins for the current group
+                normalized_margins_for_group = normalized_margins[mask]
+
+                # Create a mask for the positive margins
+                positive_group_margin_mask = normalized_margins_for_group > 0
+                positive_group_margins = normalized_margins_for_group[positive_group_margin_mask]
+                
+                # Calculate the margins for the current group
+                if positive_group_margins.numel() > 0:
+                    min_margin_for_group = torch.min(positive_group_margins)
+                else:
+                    min_margin_for_group = torch.tensor(0)
+
+                max_margin_for_group = torch.max(normalized_margins_for_group)
+                avg_margin_for_group = torch.sum(normalized_margins_for_group) / len(normalized_margins_for_group)
+
+                
+                # Append the result to the list
+                min_margins_by_group.append(min_margin_for_group.item())
+                max_margins_by_group.append(max_margin_for_group.item())
+                avg_margins_by_group.append(avg_margin_for_group.item())
+
+            if "min_margin_by_group" in self.hparams.metrics:
+                names.extend([f"min_margin_group{group}" for group in unique_groups])
+                values.extend(list(min_margins_by_group))
+            if "max_margin_by_group" in self.hparams.metrics:
+                names.extend([f"max_margin_group{group}" for group in unique_groups])
+                values.extend(list(max_margins_by_group))
+            if "avg_margin_by_group" in self.hparams.metrics:
+                names.extend([f"avg_margin_group{group}" for group in unique_groups])
+                values.extend(list(avg_margins_by_group))
+
+            self.milkshake_logger.log_helper2(names, values, dataloader_idx)
+
+    # def step_and_log_metrics(self, batch, idx, dataloader_idx, stage):
+    #     """Performs a step, then computes and logs metrics.
+
+    #     Args:
+    #         batch: A tuple containing the inputs and targets as torch.Tensor.
+    #         idx: The index of the given batch.
+    #         dataloader_idx: The index of the current dataloader.
+    #         stage: "train", "val", or "test".
+
+    #     Returns:
+    #         A dictionary containing the loss, prediction probabilities, targets, and metrics.
+    #     """
+
+    #     result = self.step(batch, idx)
+
+    #     accs = compute_accuracy(
+    #         result["probs"],
+    #         result["targets"],
+    #         self.hparams.num_classes,
+    #         self.hparams.num_groups,
+    #     )
+
+    #     self.add_metrics_to_result(result, accs, dataloader_idx)
+
+    #     self.log_metrics(result, stage, dataloader_idx)
+
+    #     # New addition to log margin metrics during the first epoch.
+    #     if idx % 2500 == 0:
+    #         collapse_metrics = self.compute_collapse_metrics()
+    #         self.log_margin_metrics(dataloader_idx)
+    #         self.log_metrics(collapse_metrics, "train", dataloader_idx)
+
+    #     return result
+
+    def training_epoch_end(self, training_step_outputs):
+        """Collates metrics upon completion of the training epoch.
+
+        Here, performs covariance matrix calculation for feature collapse.
+
+        Args:
+            training_step_outputs: List of dictionary outputs of self.training_step.
+        """
+
+        collapse_metrics = self.compute_collapse_metrics()
+
+        dataloader_idx = training_step_outputs[0]["dataloader_idx"]
+
+        self.log_margin_metrics(dataloader_idx)
+
+        self.collate_metrics(training_step_outputs, "train")
+
+        self.log_metrics(collapse_metrics, "train", dataloader_idx)
+
+    def validation_epoch_end(self, validation_step_outputs):
+        super().validation_epoch_end(validation_step_outputs)
+        log_results(
+            self.hparams,
+            self.current_epoch + 1,
+            self.trainer.logger.version, 
+            validation_step_outputs,
+            weight_aa_by_proportion=self.hparams.datamodule == "waterbirds",
+        )
+
+        collapse_metrics = self.compute_collapse_metrics()
+
+        dump_results(args, self.current_epoch + 1, collapse_metrics)
+
 
 def log_results_helper(
     args,
@@ -1094,6 +1527,8 @@ def dump_results(args, curr_epoch, curr_results):
         v = args.convnextv2_version
     elif args.model == "resnet":
         v = args.resnet_version
+    elif args.model == "swin":
+        v = args.swin_version
         
     c = args.balance_erm
     d = args.balance_retrain
@@ -1211,6 +1646,8 @@ if __name__ == "__main__":
     parser = Trainer.add_argparse_args(parser)
 
     # Arguments imported from retrain.py.
+    parser.add("--balance_erm_type", choices=["class", "group"], default="class",
+               help="Specify whether class or group balancing is used during ERM training.")
     parser.add("--balance_erm", choices=["mixture", "none", "subsetting", "upsampling", "upweighting"], default="none",
                help="Which type of class-balancing to perform during ERM training.")
     parser.add("--balance_retrain", choices=["mixture", "none", "subsetting", "upsampling", "upweighting"], default="none",
@@ -1223,6 +1660,8 @@ if __name__ == "__main__":
                help="The split to train on; either the train set or the combined train and held-out set.")
     parser.add("--train_pct", default=100, type=int,
                help="The percentage of the train set to utilize (for ablations)")
+    parser.add("--heldout", default=True, type=lambda x: bool(strtobool(x)),
+               help="Whether to perform LLR on a held-out set or the training set.")
 
     datamodules = {
         "celeba": CelebARetrain,
@@ -1234,6 +1673,7 @@ if __name__ == "__main__":
         "bert": FeatureCollapseMarginBERT,
         "convnextv2": ConvNeXtV2WithLogging,
         "resnet": FeatureCollapseMarginResNet,
+        "swin": FeatureCollapseMarginSwin,
     }
 
     args = parser.parse_args()

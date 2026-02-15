@@ -84,24 +84,28 @@ class CelebARetrain(CelebA, Retrain):
 
     def __init__(self, args, **kwargs):
         super().__init__(args, **kwargs)
-
-class CivilCommentsRetrain(CivilComments, Retrain):
-    """DataModule for the CivilCommentsRetrain dataset."""
-
-    def __init__(self, args, **kwargs):
-        super().__init__(args, **kwargs)
+        self.balance_erm_type = args.balance_erm_type  # Save balance_erm_type from args
 
 class MultiNLIRetrain(MultiNLI, Retrain):
     """DataModule for the MultiNLIRetrain dataset."""
 
     def __init__(self, args, **kwargs):
         super().__init__(args, **kwargs)
+        self.balance_erm_type = args.balance_erm_type  # Save balance_erm_type from args
+
+class CivilCommentsRetrain(CivilComments, Retrain):
+    """DataModule for the CivilCommentsRetrain dataset."""
+
+    def __init__(self, args, **kwargs):
+        super().__init__(args, **kwargs)
+        self.balance_erm_type = args.balance_erm_type  # Save balance_erm_type from args
 
 class WaterbirdsRetrain(Waterbirds, Retrain):
     """DataModule for the WaterbirdsRetrain dataset."""
 
     def __init__(self, args, **kwargs):
         super().__init__(args, **kwargs)
+        self.balance_erm_type = args.balance_erm_type  # Save balance_erm_type from args
 
 
 def get_unfrozen_params(model):
@@ -1086,7 +1090,7 @@ class FeatureCollapseMarginSwin(Swin):
         if mode != "total":
             features_by_mode = "features_by_class" if mode == "class" else "features_by_group"
 
-        num_random_vecs = 10
+        num_random_vecs = 3
 
         # ---- inter-covariance: B v = (1/M) sum_c ( (mu_c - mu) ( (mu_c - mu)^T v ) )
         def apply_inter_cov(v):
@@ -1188,12 +1192,12 @@ class FeatureCollapseMarginSwin(Swin):
             collapse_metrics: The dictionary of matrix norms for collapse.
         """
 
-        # Registers model hook to get ResNet features.
+        # Registers model hook to get Swin features.
         def get_features():
             def hook(model, input, output):
-                self.features = output.detach()
+                self.features = output[0].detach()
             return hook
-        handle = self.model.layer4.register_forward_hook(get_features())
+        handle = self.model.swin.encoder.layers[-1].blocks[-1].register_forward_hook(get_features())
 
 
         if not hasattr(self.trainer, 'train_dataloader') or self.trainer.train_dataloader is None:
@@ -1359,7 +1363,7 @@ class FeatureCollapseMarginSwin(Swin):
                 names.extend([f"avg_margin_group{group}" for group in unique_groups])
                 values.extend(list(avg_margins_by_group))
 
-            self.log_helper2(names, values, dataloader_idx)
+            self.milkshake_logger.log_helper2(names, values, dataloader_idx)
 
     # def step_and_log_metrics(self, batch, idx, dataloader_idx, stage):
     #     """Performs a step, then computes and logs metrics.
@@ -1580,6 +1584,8 @@ def dump_results(args, curr_epoch, curr_results):
         v = args.convnextv2_version
     elif args.model == "resnet":
         v = args.resnet_version
+    elif args.model == "swin":
+        v = args.swin_version
         
     c = args.balance_erm
     d = args.balance_retrain
@@ -1636,6 +1642,9 @@ if __name__ == "__main__":
     parser = Trainer.add_argparse_args(parser)
 
     # Arguments imported from retrain.py.
+    # Extend the argument parser to include balance_erm_type
+    parser.add("--balance_erm_type", choices=["class", "group"], default="class",
+               help="Specify whether class or group balancing is used during ERM training.")
     parser.add("--balance_erm", choices=["mixture", "none", "subsetting", "upsampling", "upweighting"], default="none",
                help="Which type of class-balancing to perform during ERM training.")
     parser.add("--balance_retrain", choices=["mixture", "none", "subsetting", "upsampling", "upweighting"], default="none",
@@ -1648,6 +1657,8 @@ if __name__ == "__main__":
                help="The split to train on; either the train set or the combined train and held-out set.")
     parser.add("--train_pct", default=100, type=int,
                help="The percentage of the train set to utilize (for ablations)")
+    parser.add("--heldout", default=True, type=lambda x: bool(strtobool(x)),
+               help="Whether to perform LLR on a held-out set or the training set.")
 
     datamodules = {
         "celeba": CelebARetrain,
