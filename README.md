@@ -1,5 +1,5 @@
 # On the Unreasonable Effectiveness of Last-layer Retraining
-## Official codebase for the ICLR 2025 SCSL workshop paper
+## Official codebase for the TMLR 2026 paper
 ### Installation
 ```
 conda update -n base -c defaults conda
@@ -24,10 +24,10 @@ After models are finetuned, run last-layer retraining with `exps/llr.py`.
 ### Citation and License
 This codebase uses [Milkshake](https://github.com/tmlabonte/milkshake) as a template and inherits its MIT License. Please consider using the following citation:
 ```
-@inproceedings{hill2025unreasonable,
+@article{hill2026unreasonable,
   author={John C. Hill and Tyler LaBonte and Xinchen Zhang and Vidya Muthukumar},
   title={On the Unreasonable Effectiveness of Last-layer Retraining},
-  booktitle={International Conference on Learning Representations (ICLR) Workshop on Spurious Correlations and Shortcut Learning (SCSL)},
-  year={2025},
+  journal={Transactions on Machine Learning Research (TMLR)},
+  year={2026},
 }
 ```
